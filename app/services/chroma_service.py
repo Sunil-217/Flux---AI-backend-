@@ -38,3 +38,25 @@ def get_or_create_collection(
 
     return collection
 
+
+def delete_collection(
+    chat_id: str
+):
+    """Delete the ChromaDB collection for a given chat_id."""
+
+    safe_chat_id = sanitize_chat_id(
+        chat_id
+    )
+
+    collection_name = (
+        f"chat_{safe_chat_id}"
+    )
+
+    try:
+        client.delete_collection(
+            name=collection_name
+        )
+    except Exception:
+        # Collection may not exist — safe to ignore
+        pass
+
