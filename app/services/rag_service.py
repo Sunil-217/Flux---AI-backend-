@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 from openai import OpenAI
@@ -50,7 +51,7 @@ ROUTER_SYSTEM = (
 )
 
 SYSTEM_NORMAL = (
-    "You are Flux AI, a knowledgeable and precise AI assistant. "
+    "You are Close AI, a knowledgeable and precise AI assistant. "
     "You are an expert across technology, programming, AI/ML, science, and general knowledge. "
     "When a user mentions a technical term or acronym (such as 'RAG', 'LLM', 'API', 'GAN'), "
     "interpret it in its most common technical meaning unless the context clearly says otherwise "
@@ -59,7 +60,7 @@ SYSTEM_NORMAL = (
     "briefly state your interpretation and then answer it. Be concise but complete."
 )
 
-SYSTEM_RAG = """You are Flux AI, a knowledgeable and precise AI assistant with access to an uploaded document.
+SYSTEM_RAG = """You are Close AI, a knowledgeable and precise AI assistant with access to an uploaded document.
 
 Guidelines:
 - If the user's message is about the document, answer using the context below — accurately and without making things up.
@@ -233,3 +234,75 @@ def ask_question(
         return _normal_chat(question, history)
 
     return _rag_chat(collection, question, history)
+
+
+# ── Streaming (token-by-token) — makes answers feel instant ─────────────────
+
+def _sse(payload: dict) -> str:
+    """Format a Server-Sent Event line."""
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _stream_completion(messages: list, temperature: float):
+    """Yield SSE 'token' events from a streaming chat completion."""
+    stream = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=900,
+        stream=True,
+    )
+    for chunk in stream:
+        try:
+            delta = chunk.choices[0].delta.content
+        except (IndexError, AttributeError):
+            delta = None
+        if delta:
+            yield _sse({"type": "token", "content": delta})
+
+
+def stream_question(chat_id: str, question: str, history: list = []):
+    """
+    Generator of SSE events for the /chat endpoint:
+      - optional {"type":"sources", ...} (when a PDF is loaded)
+      - many       {"type":"token", "content": "..."}
+      - final      {"type":"done"}
+    Falls back to {"type":"error"} on failure so the UI can react.
+    """
+    try:
+        collection = get_or_create_collection(chat_id)
+
+        if collection.count() == 0:
+            system_prompt = _with_web_context(SYSTEM_NORMAL, question, history)
+            messages = [{"role": "system", "content": system_prompt}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": question})
+            yield from _stream_completion(messages, 0.4)
+        else:
+            question_embedding = embedding_model.encode(question).tolist()
+            results = collection.query(
+                query_embeddings=[question_embedding],
+                n_results=3,
+            )
+            documents = results["documents"][0]
+            metadatas = results["metadatas"][0]
+            context = "\n\n".join(documents)
+
+            sources = [
+                {"content": documents[i], "metadata": metadatas[i]}
+                for i in range(len(documents))
+            ]
+            yield _sse({"type": "sources", "sources": sources})
+
+            rag_system = _with_web_context(
+                SYSTEM_RAG.format(context=context), question, history
+            )
+            messages = [{"role": "system", "content": rag_system}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": question})
+            yield from _stream_completion(messages, 0.3)
+
+        yield _sse({"type": "done"})
+
+    except Exception:
+        yield _sse({"type": "error", "message": "Failed to generate a response."})

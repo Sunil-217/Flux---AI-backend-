@@ -1,10 +1,11 @@
 from typing import List, Optional
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.services.rag_service import (
-    ask_question
+    stream_question
 )
 
 router = APIRouter()
@@ -34,11 +35,15 @@ async def chat(
         for m in (request.history or [])
     ]
 
-    response = ask_question(
-        request.chat_id,
-        request.question,
-        history
+    return StreamingResponse(
+        stream_question(
+            request.chat_id,
+            request.question,
+            history
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
-
-    return response
-
