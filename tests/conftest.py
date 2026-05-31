@@ -18,6 +18,9 @@ import pytest
 # ── Dummy key so OpenAI client construction never fails ──
 os.environ.setdefault("NVIDIA_API_KEY", "test-nvidia-key")
 
+# ── Use an in-memory DB during tests (never touch the real flux_ai.db file) ──
+os.environ.setdefault("DATABASE_URL", "sqlite://")
+
 # ── Fake the embedding service (avoid loading torch / sentence-transformers) ──
 _embed = types.ModuleType("app.services.embedding_service")
 
