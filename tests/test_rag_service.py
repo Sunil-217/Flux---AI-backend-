@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from app.services import rag_service
 
 
@@ -69,6 +71,43 @@ def test_stream_question_rag_emits_sources_first(fake_llm, fake_collection):
     assert len(events[0]["sources"]) == 2
     assert events[-1]["type"] == "done"
     assert [e["type"] for e in events if e["type"] == "token"] == ["token", "token"]
+
+
+# ── Fast-path: local time-sensitivity heuristic ──
+@pytest.mark.parametrize(
+    "question,expected",
+    [
+        ("hi", False),
+        ("write a python function to reverse a string", False),
+        ("what is RAG in gen ai", False),
+        ("what is the capital of France", False),
+        ("who is the current CSK captain", True),
+        ("latest iPhone price in India", True),
+        ("what's the weather today", True),
+        ("who won the last IPL", True),
+        ("any big news in 2026", True),
+    ],
+)
+def test_might_need_fresh_info(question, expected):
+    assert rag_service._might_need_fresh_info(question) is expected
+
+
+def test_with_web_context_skips_router_for_normal_question(monkeypatch, fake_llm):
+    """Non-time-sensitive questions must NOT trigger the LLM router (keeps it fast)."""
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    out = rag_service._with_web_context(rag_service.SYSTEM_NORMAL, "hi there", [])
+    assert out == rag_service.SYSTEM_NORMAL
+    assert fake_llm["calls"] == []  # router never called → instant streaming
+
+
+def test_with_web_context_invokes_router_for_fresh_question(monkeypatch, fake_llm):
+    """Time-sensitive questions still go through the router (correctness preserved)."""
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    fake_llm["router"] = "NO"
+    rag_service._with_web_context(
+        rag_service.SYSTEM_NORMAL, "who is the current CSK captain", []
+    )
+    assert any(c.get("model") == rag_service.ROUTER_MODEL for c in fake_llm["calls"])
 
 
 def test_stream_question_history_is_threaded(fake_llm, fake_collection):

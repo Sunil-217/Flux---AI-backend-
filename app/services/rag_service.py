@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 
 from openai import OpenAI
@@ -50,6 +51,18 @@ ROUTER_SYSTEM = (
     "Q: who won the last IPL\nA: most recent IPL winner"
 )
 
+# Reply-language rule shared by both modes.
+LANGUAGE_RULE = (
+    "LANGUAGE: Detect the language of the user's latest message and reply ONLY in that same "
+    "language. Do NOT translate your answer or add parenthetical translations in another language. "
+    "If the user writes in English (e.g. 'hi', 'what is my name'), you MUST reply in plain English. "
+    "If they write in Tamil, reply in Tamil; Hindi -> Hindi; Telugu -> Telugu, and so on. "
+    "If they write an Indian language using English/Latin letters (romanized, e.g. "
+    "'neenga eppadi irukeenga'), reply in that same romanized style, not the native script. "
+    "Only use a non-English language when the user clearly wrote in that language, or explicitly "
+    "asked for the answer in it."
+)
+
 SYSTEM_NORMAL = (
     "You are Close AI, a knowledgeable and precise AI assistant. "
     "You are an expert across technology, programming, AI/ML, science, and general knowledge. "
@@ -57,19 +70,44 @@ SYSTEM_NORMAL = (
     "interpret it in its most common technical meaning unless the context clearly says otherwise "
     "(for example, in an AI/tech context 'RAG' means Retrieval-Augmented Generation, not music). "
     "Give accurate, clear, well-structured answers. If a question is genuinely ambiguous, "
-    "briefly state your interpretation and then answer it. Be concise but complete."
+    "briefly state your interpretation and then answer it. Be concise but complete. "
+    + LANGUAGE_RULE
 )
 
-SYSTEM_RAG = """You are Close AI, a knowledgeable and precise AI assistant with access to an uploaded document.
+SYSTEM_RAG = (
+    "You are Close AI, a knowledgeable and precise AI assistant with access to an uploaded document.\n\n"
+    "Guidelines:\n"
+    "- If the user's message is about the document, answer using the context below — accurately and without making things up.\n"
+    "- If the user sends a greeting or a general question unrelated to the document, answer it naturally and helpfully using your own knowledge — do NOT say \"no context\" or refuse.\n"
+    "- Interpret technical acronyms in their common technical meaning (e.g. 'RAG' = Retrieval-Augmented Generation).\n"
+    "- Be accurate, clear, and concise.\n"
+    "- " + LANGUAGE_RULE + "\n\n"
+    "Document Context:\n{context}"
+)
 
-Guidelines:
-- If the user's message is about the document, answer using the context below — accurately and without making things up.
-- If the user sends a greeting or a general question unrelated to the document, answer it naturally and helpfully using your own knowledge — do NOT say "no context" or refuse.
-- Interpret technical acronyms in their common technical meaning (e.g. 'RAG' = Retrieval-Augmented Generation).
-- Be accurate, clear, and concise.
 
-Document Context:
-{context}"""
+# Cheap local pre-filter: only questions matching these time-sensitive signals
+# are sent to the (slower) LLM router + web search. Everything else streams
+# immediately — so greetings, coding and general questions answer in ~1s.
+_FRESH_INFO_PATTERNS = re.compile(
+    r"\b("
+    r"current(?:ly)?|latest|recent(?:ly)?|nowadays|today|tonight|tomorrow|yesterday|"
+    r"news|headlines?|price|prices|cost|stock|market|weather|forecast|temperature|"
+    r"score|scores|standings?|fixtures?|champion|winner|trending|live|newest|"
+    r"release date|just launched|up to date|as of"
+    r")\b"
+    r"|\bthis (?:year|month|week)\b"
+    r"|\bright now\b"
+    r"|\bwho (?:is|are|'s) the current\b"
+    r"|\bwho won\b"
+    r"|\b20(?:2[4-9]|3\d)\b",
+    re.IGNORECASE,
+)
+
+
+def _might_need_fresh_info(question: str) -> bool:
+    """Fast, local check — does the question look time-sensitive at all?"""
+    return bool(_FRESH_INFO_PATTERNS.search(question or ""))
 
 
 def _needs_web_search(question: str, history: list = []):
@@ -113,6 +151,11 @@ def _with_web_context(base_system: str, question: str, history: list) -> str:
     If the question needs current info, run a web search and append the
     results (plus today's date) to the system prompt. Otherwise return it unchanged.
     """
+
+    # Skip the LLM router entirely unless the question looks time-sensitive —
+    # this is what keeps the common case instant.
+    if not is_search_available() or not _might_need_fresh_info(question):
+        return base_system
 
     query = _needs_web_search(question, history)
     if not query:
