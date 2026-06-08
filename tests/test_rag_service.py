@@ -73,6 +73,19 @@ def test_stream_question_rag_emits_sources_first(fake_llm, fake_collection):
     assert [e["type"] for e in events if e["type"] == "token"] == ["token", "token"]
 
 
+def test_stream_question_skips_irrelevant_sources(fake_llm, fake_collection):
+    """Off-topic question (chunks dissimilar) → no source chips."""
+    fake_collection.count.return_value = 3
+    fake_collection.query.return_value = {
+        "documents": [["unrelated chunk"]],
+        "metadatas": [[{"filename": "a.pdf"}]],
+        "embeddings": [[[-0.1, -0.2, -0.3]]],  # opposite of the query vector → low similarity
+    }
+    events = _parse(rag_service.stream_question("c1", "totally off-topic", []))
+    assert not any(e["type"] == "sources" for e in events)
+    assert events[-1]["type"] == "done"
+
+
 # ── Fast-path: local time-sensitivity heuristic ──
 @pytest.mark.parametrize(
     "question,expected",
@@ -92,22 +105,36 @@ def test_might_need_fresh_info(question, expected):
     assert rag_service._might_need_fresh_info(question) is expected
 
 
-def test_with_web_context_skips_router_for_normal_question(monkeypatch, fake_llm):
+def test_ground_prompt_skips_router_for_normal_question(monkeypatch, fake_llm):
     """Non-time-sensitive questions must NOT trigger the LLM router (keeps it fast)."""
     monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
-    out = rag_service._with_web_context(rag_service.SYSTEM_NORMAL, "hi there", [])
-    assert out == rag_service.SYSTEM_NORMAL
+    out = rag_service._ground_prompt(rag_service.SYSTEM_NORMAL, "hi there", [], "c1")
+    # The base system prompt is preserved (today's date is appended for grounding).
+    assert out.startswith(rag_service.SYSTEM_NORMAL)
+    # The unique marker injected only when live web results are fetched must be absent.
+    assert "The following are live web search results" not in out
     assert fake_llm["calls"] == []  # router never called → instant streaming
 
 
-def test_with_web_context_invokes_router_for_fresh_question(monkeypatch, fake_llm):
+def test_ground_prompt_invokes_router_for_fresh_question(monkeypatch, fake_llm):
     """Time-sensitive questions still go through the router (correctness preserved)."""
     monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
     fake_llm["router"] = "NO"
-    rag_service._with_web_context(
-        rag_service.SYSTEM_NORMAL, "who is the current CSK captain", []
+    rag_service._ground_prompt(
+        rag_service.SYSTEM_NORMAL, "who is the current CSK captain", [], "c1"
     )
     assert any(c.get("model") == rag_service.ROUTER_MODEL for c in fake_llm["calls"])
+
+
+def test_stream_question_with_image_uses_vision(fake_llm):
+    """When an image is attached, the vision model is used."""
+    fake_llm["stream_tokens"] = ["A ", "pink ", "square."]
+    events = _parse(
+        rag_service.stream_question("c1", "what is this", [], image="data:image/png;base64,abc")
+    )
+    assert any(e["type"] == "token" for e in events)
+    assert events[-1]["type"] == "done"
+    assert any(c.get("model") == rag_service.VISION_MODEL for c in fake_llm["calls"])
 
 
 def test_stream_question_history_is_threaded(fake_llm, fake_collection):

@@ -7,11 +7,19 @@ Gracefully returns an empty string if no API key is configured or the
 search fails, so the chat flow never breaks.
 """
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
 from tavily import TavilyClient
 
 from app.core.config import (
     TAVILY_API_KEY
 )
+
+# Hard ceiling on a single web search — Tavily SDK doesn't accept a timeout
+# parameter, so we wrap each call in a future and abandon it if it stalls.
+# Without this, a slow Tavily can hang stream_question for minutes.
+_SEARCH_TIMEOUT_S = 12
+_search_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tavily")
 
 
 # Only build a client if a key is present — keeps the app working
@@ -41,12 +49,15 @@ def web_search(query: str, max_results: int = 5) -> str:
         return ""
 
     try:
-        response = _tavily.search(
+        # Bound the call so a slow Tavily can't wedge the chat stream.
+        future = _search_pool.submit(
+            _tavily.search,
             query=query,
             max_results=max_results,
-            search_depth="basic"
+            search_depth="basic",
         )
-    except Exception:
+        response = future.result(timeout=_SEARCH_TIMEOUT_S)
+    except (FuturesTimeout, Exception):
         return ""
 
     results = response.get("results", [])

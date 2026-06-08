@@ -1,5 +1,6 @@
 """Password hashing (bcrypt) + JWT tokens + the current-user dependency."""
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import JWT_SECRET, JWT_EXPIRE_MINUTES
 from app.db import get_db
-from app.models import User
+from app.models import User, UserChats
 
 _ALGORITHM = "HS256"
 _bearer = HTTPBearer(auto_error=False)
@@ -56,4 +57,36 @@ def get_current_user(
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
+    return user
+
+
+def user_owns_chat(db: Session, user: User, chat_id: str) -> bool:
+    """True iff `chat_id` appears in this user's saved sessions blob.
+
+    We store all of a user's chats as one JSON blob in UserChats. Chat IDs are
+    client-generated UUIDs (server doesn't index them), so on any per-chat
+    action we have to consult the blob to confirm ownership.
+    """
+    rec = db.get(UserChats, user.id)
+    if rec is None:
+        return False
+    try:
+        sessions = json.loads(rec.data) or []
+    except Exception:
+        return False
+    return any(isinstance(s, dict) and s.get("id") == chat_id for s in sessions)
+
+
+def require_chat_ownership(
+    chat_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """FastAPI dependency: 404 if the caller doesn't own this chat.
+
+    Returns 404 (not 403) on purpose — don't leak existence of other users'
+    chat IDs.
+    """
+    if not user_owns_chat(db, user, chat_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Chat not found")
     return user

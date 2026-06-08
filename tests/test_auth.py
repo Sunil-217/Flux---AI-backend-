@@ -112,3 +112,52 @@ def test_duplicate_verified_signup_rejected(client):
     client.post("/auth/verify-otp", json={"email": SIGNUP["email"], "code": client.otp_box["code"]})
     r = client.post("/auth/signup", json=SIGNUP)
     assert r.status_code == 400
+
+
+# ── Forgot / reset password ──
+def _signup_and_verify(client):
+    client.post("/auth/signup", json=SIGNUP)
+    client.post("/auth/verify-otp", json={"email": SIGNUP["email"], "code": client.otp_box["code"]})
+
+
+def test_forgot_password_sends_code(client):
+    _signup_and_verify(client)
+    client.otp_box.clear()
+    r = client.post("/auth/forgot-password", json={"email": SIGNUP["email"]})
+    assert r.status_code == 200
+    assert "code" in client.otp_box  # a reset code was issued
+
+
+def test_forgot_password_unknown_email_is_silent(client):
+    client.otp_box.clear()
+    r = client.post("/auth/forgot-password", json={"email": "nobody@example.com"})
+    assert r.status_code == 200  # generic response
+    assert "code" not in client.otp_box  # no code issued for a non-existent account
+
+
+def test_reset_password_full_flow(client):
+    _signup_and_verify(client)
+    client.otp_box.clear()
+    client.post("/auth/forgot-password", json={"email": SIGNUP["email"]})
+    reset_code = client.otp_box["code"]
+
+    r = client.post(
+        "/auth/reset-password",
+        json={"email": SIGNUP["email"], "code": reset_code, "new_password": "newsecret456"},
+    )
+    assert r.status_code == 200
+    assert "access_token" in r.json()
+
+    # old password rejected, new password works
+    assert client.post("/auth/signin", json={"email": SIGNUP["email"], "password": SIGNUP["password"]}).status_code == 401
+    assert client.post("/auth/signin", json={"email": SIGNUP["email"], "password": "newsecret456"}).status_code == 200
+
+
+def test_reset_password_wrong_code(client):
+    _signup_and_verify(client)
+    client.post("/auth/forgot-password", json={"email": SIGNUP["email"]})
+    r = client.post(
+        "/auth/reset-password",
+        json={"email": SIGNUP["email"], "code": "000000", "new_password": "newsecret456"},
+    )
+    assert r.status_code == 400

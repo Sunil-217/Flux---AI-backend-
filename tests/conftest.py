@@ -40,11 +40,16 @@ class _FakeEmbeddingModel:
 _embed.embedding_model = _FakeEmbeddingModel()
 _embed.chunk_text = lambda text: ([text] if text else [])
 _embed.create_embeddings = lambda chunks: [[0.1, 0.2, 0.3] for _ in chunks]
+# Matches the fake collection's stored embeddings → cosine similarity 1.0 (relevant).
+_embed.embed_query = lambda text: [0.1, 0.2, 0.3]
 sys.modules["app.services.embedding_service"] = _embed
 
 # ── Fake the PDF service (avoid PyMuPDF) ──
 _pdf = types.ModuleType("app.services.pdf_service")
 _pdf.extract_text_from_pdf = lambda path: "Sample extracted PDF text for testing."
+_pdf.extract_text_from_docx = lambda path: "Sample extracted DOCX text for testing."
+# upload.py imports the unified entry point; accept (file_path, ext).
+_pdf.extract_text_from_file = lambda path, ext=None: "Sample extracted text for testing."
 sys.modules["app.services.pdf_service"] = _pdf
 
 # ── Stop ChromaDB from opening a real on-disk database during tests ──
@@ -94,10 +99,16 @@ def fake_llm(monkeypatch):
 
     def fake_create(*args, **kwargs):
         state["calls"].append(kwargs)
-        if kwargs.get("model") == rag_service.ROUTER_MODEL:
-            return make_completion(state["router"])
+        # Any streaming call is answer generation.
         if kwargs.get("stream"):
             return iter(make_stream(state["stream_tokens"]))
+        # The router is identified by its system prompt (ROUTER_SYSTEM), NOT by
+        # model name — MODEL and ROUTER_MODEL are the same string, so a
+        # model-name check would misclassify normal answer calls as router calls.
+        msgs = kwargs.get("messages") or []
+        is_router = bool(msgs) and msgs[0].get("content") == rag_service.ROUTER_SYSTEM
+        if is_router:
+            return make_completion(state["router"])
         return make_completion(state["completion_text"])
 
     monkeypatch.setattr(rag_service.client.chat.completions, "create", fake_create)
@@ -111,9 +122,11 @@ def fake_collection(monkeypatch):
 
     col = MagicMock()
     col.count.return_value = 0
+    # Embeddings identical to the fake query vector → cosine similarity 1.0 → relevant.
     col.query.return_value = {
         "documents": [["First chunk.", "Second chunk."]],
         "metadatas": [[{"filename": "a.pdf"}, {"filename": "a.pdf"}]],
+        "embeddings": [[[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]]],
     }
     monkeypatch.setattr(rag_service, "get_or_create_collection", lambda chat_id: col)
     return col

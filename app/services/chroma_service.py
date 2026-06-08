@@ -1,9 +1,27 @@
 
+import logging
+import os
+
+# Must be set BEFORE importing chromadb — some versions read this at import
+# time when wiring up their telemetry client.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
+# ChromaDB 0.4.24 calls posthog.capture() with 3 positional args, but
+# posthog 7.x only accepts 1 → every telemetry event raises TypeError and
+# ChromaDB logs "Failed to send telemetry event …: capture() takes 1
+# positional argument but 3 were given". It's harmless noise from a known
+# version mismatch. We don't want a self-hosted app phoning home anyway, so
+# we both (a) disable telemetry via Settings and (b) hard-silence the
+# telemetry logger so the broken call can't print even if it still fires.
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+
 import chromadb
+from chromadb.config import Settings
 import re
 
 client = chromadb.PersistentClient(
-    path="chroma_db"
+    path="chroma_db",
+    settings=Settings(anonymized_telemetry=False),
 )
 
 
