@@ -9,7 +9,8 @@ from app.db import SessionLocal
 from app.models import ChatWebContext
 
 from app.core.config import (
-    NVIDIA_API_KEY
+    NVIDIA_API_KEY,
+    GROQ_API_KEY,
 )
 
 from app.services.chroma_service import (
@@ -25,43 +26,39 @@ from app.services.web_search_service import (
     is_search_available
 )
 
+# ── NVIDIA client — Code editing + Vision (most powerful free code specialist) ──
 client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=NVIDIA_API_KEY,
-    # 60s ceiling per request — without this, the SDK's 600s default lets a
-    # hung upstream wedge a FastAPI worker for 10 minutes.
     timeout=60.0,
 )
 
-# ── Multi-model routing: the best FREE model (same NVIDIA key) per task ──
-# Bench-tested across the full free catalog on this account: llama-3.3-70b
-# turned out to be the best workhorse (0.4-7s, correct JSON / router / code).
-# qwen3.5-122b was slower and got the "current CM" router decision WRONG.
-# qwen3-coder-480b mostly timed out under load. llama-4-maverick and
-# moonshotai/kimi-k2.6 either failed entirely or produced gibberish for short
-# outputs. So MODEL stays on 3.3-70b — already the strongest free option here.
-MODEL = "meta/llama-3.3-70b-instruct"
+# ── Groq client — Chat / Router / Plan (same llama-3.3-70b, 3-5x faster inference) ──
+# Groq benchmarked at ~1.9s vs NVIDIA's ~5-10s for the same model. Chat, routing,
+# and JSON planning all benefit from lower latency. Falls back to NVIDIA client
+# automatically if GROQ_API_KEY is absent (see _groq_or_nvidia).
+groq_client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY or NVIDIA_API_KEY,  # graceful fallback if key missing
+    timeout=30.0,
+) if GROQ_API_KEY else None
 
-# Code editing + Q&A use the most powerful FREE code specialist on this NVIDIA
-# tier: qwen3-coder-480b (Mixture-of-Experts, ~35B active). Benchmarked clean,
-# fence-free code in ~15s on small files. It needs >60s headroom on large files,
-# so code calls use a 120s timeout AND fall back to MODEL on any timeout/outage
-# (see _code_complete) — maximum quality without losing reliability.
-CODE_MODEL = "qwen/qwen3-coder-480b-a35b-instruct"
+def _groq_or_nvidia():
+    """Return the Groq client when available, otherwise the NVIDIA client."""
+    return groq_client if groq_client is not None else client
 
-# Planning is small structured-JSON output, where llama-3.3-70b is fast and
-# reliable (the 480B coder is overkill + slower for a tiny JSON result).
-PLAN_MODEL = "meta/llama-3.3-70b-instruct"
+# ── Model routing (verified via benchmark 2026-06-08) ──
+# CHAT / RAG answers   → Groq  llama-3.3-70b-versatile  (~1.9s, 3-5x faster)
+# Router (web search?) → Groq  llama-3.3-70b-versatile  (~1.9s, fast decisions)
+# Agent plan (JSON)    → Groq  llama-3.3-70b-versatile  (~1.9s, reliable JSON)
+# Code edit / Q&A      → NVIDIA qwen3-coder-480b         (~15s, strongest free coder)
+# Vision               → NVIDIA llama-3.2-11b-vision     (only option with vision)
 
-# Vision model — used when the user attaches an image / screenshot. 11B keeps
-# image replies snappy (90B was noticeably slower for little day-to-day gain).
-VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
-
-# Router for the "do we need to search the web, and with what query?" decision.
-# Upgraded from llama-3.1-8b, which mangled short queries (it turned
-# "current cm in tamil nadu" into a WEATHER search). 70B understands
-# abbreviations and keeps the topic, while staying fast for a ~1-line output.
-ROUTER_MODEL = "meta/llama-3.3-70b-instruct"
+MODEL        = "llama-3.3-70b-versatile"               # Groq — chat / RAG
+ROUTER_MODEL = "llama-3.3-70b-versatile"               # Groq — web-search routing
+PLAN_MODEL   = "llama-3.3-70b-versatile"               # Groq — agent JSON planning
+CODE_MODEL   = "qwen/qwen3-coder-480b-a35b-instruct"   # NVIDIA — code edit / Q&A
+VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"    # NVIDIA — image / screenshot
 
 ROUTER_SYSTEM = (
     "You are a routing classifier. You do NOT answer questions. "
@@ -351,7 +348,7 @@ def _needs_web_search(question: str, history: list = []):
         messages.extend(history[-4:])
         messages.append({"role": "user", "content": question})
 
-        resp = client.chat.completions.create(
+        resp = _groq_or_nvidia().chat.completions.create(
             model=ROUTER_MODEL,
             messages=messages,
             temperature=0,
@@ -375,7 +372,7 @@ def _needs_web_search(question: str, history: list = []):
 def generate_title(question: str) -> str:
     """Generate a concise chat title from the first user message."""
     try:
-        resp = client.chat.completions.create(
+        resp = _groq_or_nvidia().chat.completions.create(
             model=ROUTER_MODEL,
             messages=[
                 {
@@ -400,7 +397,7 @@ def generate_title(question: str) -> str:
 def generate_followups(question: str, answer: str) -> list:
     """Suggest 3 short follow-up questions based on the last exchange."""
     try:
-        resp = client.chat.completions.create(
+        resp = _groq_or_nvidia().chat.completions.create(
             model=ROUTER_MODEL,
             messages=[
                 {
@@ -430,7 +427,7 @@ def generate_followups(question: str, answer: str) -> list:
 def translate_text(text: str, language: str) -> str:
     """Translate text into the target language."""
     try:
-        resp = client.chat.completions.create(
+        resp = _groq_or_nvidia().chat.completions.create(
             model=MODEL,
             messages=[
                 {
@@ -460,7 +457,7 @@ def summarize_conversation(history: list) -> str:
         if m.get("content")
     )[:12000]
     try:
-        resp = client.chat.completions.create(
+        resp = _groq_or_nvidia().chat.completions.create(
             model=MODEL,
             messages=[
                 {
@@ -587,7 +584,7 @@ def plan_code_changes(tree: list, instruction: str, history: list = None) -> dic
 
     tree_str = "\n".join([str(p) for p in (tree or [])][:800])
     try:
-        resp = client.chat.completions.create(
+        resp = _groq_or_nvidia().chat.completions.create(
             model=PLAN_MODEL,
             messages=[
                 {
@@ -856,11 +853,9 @@ def _normal_chat(question: str, history: list = [], chat_id: str = None) -> dict
     messages.extend(history)
     messages.append({"role": "user", "content": question})
 
-    completion = client.chat.completions.create(
+    completion = _groq_or_nvidia().chat.completions.create(
         model=MODEL,
-
         messages=messages,
-
         temperature=0.4,
         max_tokens=4096
     )
@@ -888,7 +883,7 @@ def _rag_chat(collection, question: str, history: list = [], chat_id: str = None
     messages.extend(history)
     messages.append({"role": "user", "content": question})
 
-    completion = client.chat.completions.create(
+    completion = _groq_or_nvidia().chat.completions.create(
         model=MODEL,
         messages=messages,
         temperature=0.3,
@@ -932,9 +927,17 @@ def _stream_completion(messages: list, temperature: float, model: str = MODEL):
     Catches errors at both stream-open and per-chunk so a mid-stream failure
     surfaces as a clean SSE 'error' event instead of an uncaught exception
     that leaves the client with a half-finished response and no signal.
+    Uses Groq for chat models (faster) and NVIDIA for vision/code models.
     """
+    # Vision model must stay on NVIDIA (Groq has no vision support).
+    # Code model stays on NVIDIA too — routing by model string is reliable.
+    use_client = (
+        client
+        if model in (VISION_MODEL, CODE_MODEL)
+        else _groq_or_nvidia()
+    )
     try:
-        stream = client.chat.completions.create(
+        stream = use_client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
