@@ -63,6 +63,23 @@ def test_stream_question_normal_yields_tokens_then_done(fake_llm, fake_collectio
     assert "".join(e["content"] for e in events if e["type"] == "token") == "Hello!"
 
 
+def test_stream_question_falls_back_when_first_provider_cannot_start(
+    monkeypatch, fake_llm, fake_collection
+):
+    fake_collection.count.return_value = 0
+    monkeypatch.setattr(rag_service, "groq_client", rag_service.client)
+    fake_llm["fail_stream_once"] = True
+    fake_llm["stream_tokens"] = ["fallback"]
+
+    events = _parse(rag_service.stream_question("c1", "hi", []))
+
+    assert [e["type"] for e in events if e["type"] == "token"] == ["token"]
+    assert events[-1]["type"] == "done"
+    stream_calls = [c for c in fake_llm["calls"] if c.get("stream")]
+    assert len(stream_calls) == 2
+    assert stream_calls[-1]["model"] == rag_service.NVIDIA_CHAT_MODEL
+
+
 def test_stream_question_rag_emits_sources_first(fake_llm, fake_collection):
     fake_collection.count.return_value = 3
     fake_llm["stream_tokens"] = ["A", "B"]
@@ -87,6 +104,33 @@ def test_stream_question_skips_irrelevant_sources(fake_llm, fake_collection):
 
 
 # ── Fast-path: local time-sensitivity heuristic ──
+def test_filename_candidates_include_sanitized_upload_name():
+    candidates = rag_service._filename_candidates(["Sunil Gen AI.pdf"])
+    assert "Sunil Gen AI.pdf" in candidates
+    assert "Sunil_Gen_AI.pdf" in candidates
+
+
+def test_retrieve_relevant_retries_when_active_doc_filter_is_stale(fake_collection):
+    fake_collection.query.side_effect = [
+        {"documents": [[]], "metadatas": [[]], "embeddings": [[]]},
+        {
+            "documents": [["First chunk."]],
+            "metadatas": [[{"filename": "Sunil_Gen_AI.pdf"}]],
+            "embeddings": [[[0.1, 0.2, 0.3]]],
+        },
+    ]
+
+    context, sources = rag_service._retrieve_relevant(
+        fake_collection, "openings irukka da", ["Sunil Gen AI.pdf"]
+    )
+
+    assert context == "First chunk."
+    assert len(sources) == 1
+    first_where = fake_collection.query.call_args_list[0].kwargs["where"]
+    assert "Sunil_Gen_AI.pdf" in first_where["filename"]["$in"]
+    assert "where" not in fake_collection.query.call_args_list[1].kwargs
+
+
 @pytest.mark.parametrize(
     "question,expected",
     [

@@ -19,6 +19,13 @@ from app.api.routes import url
 from app.api.routes import assist
 from app.api.routes import share
 from app.api.routes import generate
+from app.api.routes import apikeys
+from app.api.routes import public_api
+from app.api.routes import research
+from app.api.routes import memory
+from app.api.routes import quiz
+from app.api.routes import media_sources
+from app.api.routes import tts
 
 # Create database tables if they don't exist yet.
 Base.metadata.create_all(bind=engine)
@@ -78,6 +85,18 @@ app.include_router(url.router)
 app.include_router(assist.router)
 app.include_router(share.router)
 app.include_router(generate.router)
+app.include_router(apikeys.router)
+app.include_router(public_api.router)  # /v1/* — OpenAI-compatible developer API
+app.include_router(research.router)    # /research — deep research with citations
+app.include_router(memory.router)      # /memory — cross-chat user memory
+app.include_router(quiz.router)        # /quiz — quiz generator from docs/content
+app.include_router(media_sources.router)  # /upload-youtube, /upload-github
+app.include_router(tts.router)         # /tts — neural text-to-speech (edge-tts)
+
+# Telegram bridge (optional): starts a polling thread when TELEGRAM_BOT_TOKEN is set.
+from app.services.telegram_bot import start_telegram_bridge  # noqa: E402
+
+start_telegram_bridge()
 
 
 @app.get("/")

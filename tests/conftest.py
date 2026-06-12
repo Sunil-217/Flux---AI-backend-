@@ -17,6 +17,7 @@ import pytest
 
 # ── Dummy key so OpenAI client construction never fails ──
 os.environ.setdefault("NVIDIA_API_KEY", "test-nvidia-key")
+os.environ.setdefault("GROQ_API_KEY", "")
 
 # ── Use an in-memory DB during tests (never touch the real flux_ai.db file) ──
 os.environ.setdefault("DATABASE_URL", "sqlite://")
@@ -94,6 +95,7 @@ def fake_llm(monkeypatch):
         "completion_text": "Hello from the model.",
         "stream_tokens": ["Hel", "lo", "."],
         "router": "NO",
+        "fail_stream_once": False,
         "calls": [],
     }
 
@@ -101,6 +103,9 @@ def fake_llm(monkeypatch):
         state["calls"].append(kwargs)
         # Any streaming call is answer generation.
         if kwargs.get("stream"):
+            if state["fail_stream_once"]:
+                state["fail_stream_once"] = False
+                raise RuntimeError("temporary stream start failure")
             return iter(make_stream(state["stream_tokens"]))
         # The router is identified by its system prompt (ROUTER_SYSTEM), NOT by
         # model name — MODEL and ROUTER_MODEL are the same string, so a
@@ -112,6 +117,8 @@ def fake_llm(monkeypatch):
         return make_completion(state["completion_text"])
 
     monkeypatch.setattr(rag_service.client.chat.completions, "create", fake_create)
+    if rag_service.groq_client is not None:
+        monkeypatch.setattr(rag_service.groq_client.chat.completions, "create", fake_create)
     return state
 
 

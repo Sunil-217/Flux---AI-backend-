@@ -57,6 +57,7 @@ def _groq_or_nvidia():
 MODEL        = "llama-3.3-70b-versatile"               # Groq — chat / RAG
 ROUTER_MODEL = "llama-3.3-70b-versatile"               # Groq — web-search routing
 PLAN_MODEL   = "llama-3.3-70b-versatile"               # Groq — agent JSON planning
+NVIDIA_CHAT_MODEL = "meta/llama-3.3-70b-instruct"      # NVIDIA — fallback chat / RAG
 CODE_MODEL   = "qwen/qwen3-coder-480b-a35b-instruct"   # NVIDIA — code edit / Q&A
 VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"    # NVIDIA — image / screenshot
 
@@ -91,25 +92,25 @@ ROUTER_SYSTEM = (
 
 # Reply-language rule shared by both modes.
 LANGUAGE_RULE = (
-    "LANGUAGE — MIRROR THE USER EXACTLY:\n"
-    "- Detect the user's language and script from their LATEST message. Reply ONLY in that same "
-    "language and script. Do NOT translate, do NOT add parenthetical translations in another "
-    "language, do NOT switch back to English unless the user does.\n"
-    "- Native scripts: Tamil (தமிழ்) → Tamil, Hindi (हिन्दी) → Hindi, Telugu (తెలుగు) → Telugu, "
-    "Malayalam (മലയാളം) → Malayalam, Kannada (ಕನ್ನಡ) → Kannada, Bengali (বাংলা) → Bengali, "
-    "Marathi → Marathi, Gujarati → Gujarati, Punjabi → Punjabi, Urdu (اردو) → Urdu, "
-    "Arabic (العربية) → Arabic, Spanish → Spanish, French → French, German → German, "
-    "Portuguese → Portuguese, Russian (русский) → Russian, Japanese (日本語) → Japanese, "
-    "Korean (한국어) → Korean, Chinese (中文) → Chinese, etc. If the user clearly wrote in any "
-    "of these, you MUST reply in that same language and script.\n"
-    "- Romanized Indian languages (Tanglish, Hinglish, Tenglish, Manglish, Kanglish, Benglish): if "
-    "the user writes their language in Latin/English letters, reply in the SAME romanized style, "
-    "NOT in the native script. Example: Hinglish input 'aap kaise ho' → Hinglish reply, not Hindi "
-    "Devanagari.\n"
-    "- Mixed code-switching (e.g. half English, half Tanglish in one message) is normal: keep the "
-    "same blend in your reply, matching the user's vibe.\n"
-    "- Only reply in English when the user wrote in plain English, OR they explicitly asked for "
-    "the answer in English.\n\n"
+    "LANGUAGE — MATCH THE USER'S SCRIPT EXACTLY. THIS RULE OVERRIDES EVERYTHING ELSE:\n"
+    "STEP 1 — look at the ALPHABET (script) of the user's LATEST message, before anything else:\n"
+    "  • LATIN / ENGLISH alphabet (a-z), INCLUDING romanized Indian languages — Tanglish, "
+    "Hinglish, Tenglish, Manglish, Kanglish: your ENTIRE reply MUST be written in the LATIN "
+    "alphabet too. You are STRICTLY FORBIDDEN from outputting Tamil (தமிழ்), Devanagari (हिन्दी), "
+    "Telugu, Malayalam, Kannada, Bengali, or ANY other native/Indic script. For example "
+    "'tanglish la tha da', 'code venum da', 'RAG nu enna' are LATIN input → reply in ROMANIZED "
+    "Tanglish using ONLY English letters (e.g. 'RAG-nu Retrieval-Augmented Generation da. Idhu "
+    "oru technique...'), NEVER in தமிழ் script. A Tamil/Hindi answer written in English letters is "
+    "what is required — do NOT convert it to native script.\n"
+    "  • NATIVE script (the user actually typed தமிழ் / हिन्दी / العربية / 中文 / 日本語 etc.): "
+    "reply in that SAME native script.\n"
+    "STEP 2 — match the LANGUAGE and tone: romanized-Tamil in → romanized-Tamil out; Hinglish in → "
+    "Hinglish out; English in → English out; native-script in → same native script out. Keep the "
+    "user's code-switching blend (half English/half Tanglish is fine — mirror it). Do NOT add "
+    "parenthetical translations.\n"
+    "OVERRIDE: If the user explicitly asks for 'Tanglish' / 'Hinglish' / 'English letters' / "
+    "'romanized' / 'tanglish la' — ALWAYS use the LATIN alphabet, no matter what. Only reply in "
+    "pure English if the user wrote in pure English or explicitly asked for English.\n\n"
     "UNDERSTANDING CASUAL TANGLISH: Tamil filler/casual particles are informal tone, NOT something "
     "to question. Common ones: 'da'/'machan'/'machi' (casual 'bro'), 'tha'/'dhaan' (emphasis: "
     "just/itself), 'kudu'/'kodu'/'tha'/'venum' (give / I want / need), 'ha'/'aa' (makes it a "
@@ -211,6 +212,31 @@ MATH_RULE = (
     "instead of plain-text symbols like the square-root character."
 )
 
+# The core "answer like Claude / ChatGPT" rule — rich, well-structured, depth
+# calibrated to the question. This is what makes replies feel premium.
+FORMAT_DEPTH_RULE = (
+    "ANSWER DEPTH & FORMATTING — respond like a top-tier assistant (Claude / ChatGPT):\n"
+    "- CALIBRATE DEPTH to the question. A greeting or a quick factual lookup gets a short, direct "
+    "answer (1-3 sentences). But anything conceptual, technical, or open-ended — 'explain', 'what "
+    "is', 'how does', 'why', 'difference between', 'how do I', 'best way to', 'compare' — deserves "
+    "a THOROUGH, genuinely helpful answer. Default to richer rather than terse for these; never "
+    "give a one-line reply to a question that wants understanding.\n"
+    "- STRUCTURE longer answers for skimmability: open with a 1-2 sentence direct answer or "
+    "definition, then expand in clearly separated sections. Use markdown headings (## and ###), "
+    "**bold** for key terms, and bulleted or numbered lists for steps, features, and options.\n"
+    "- EXPLAIN, don't just state: give the reasoning and the 'why', cover trade-offs, and include "
+    "at least one concrete example, analogy, or mini code snippet for any non-trivial concept. "
+    "Show, then tell.\n"
+    "- Use a markdown TABLE for comparisons (X vs Y), fenced ```code blocks``` with a language tag "
+    "for code, and short blockquotes (>) for important notes, tips, or caveats.\n"
+    "- Close a substantial answer with a brief **takeaway**, summary line, or sensible next step "
+    "when it helps — but NEVER pad with filler, boilerplate, or repetition. Every sentence must "
+    "earn its place. Be complete: anticipate the obvious follow-up and address it.\n"
+    "- Aim for the clarity of a knowledgeable expert teaching a sharp beginner: warm, precise, and "
+    "well-organized. All of this still obeys the LANGUAGE rule — match the user's language; a "
+    "detailed Tanglish answer is detailed AND in Tanglish."
+)
+
 # Optional response-style presets the user can pick in Settings. Appended to the
 # system prompt at request time so they steer tone WITHOUT overriding accuracy.
 STYLE_RULES = {
@@ -251,7 +277,9 @@ SYSTEM_NORMAL = (
     "interpret it in its most common technical meaning unless the context clearly says otherwise "
     "(for example, in an AI/tech context 'RAG' means Retrieval-Augmented Generation, not music). "
     "Give accurate, clear, well-structured answers. If a question is genuinely ambiguous, "
-    "briefly state your interpretation and then answer it. Be concise but complete.\n\n"
+    "briefly state your interpretation and then answer it. Calibrate the length of your reply to "
+    "the question (see ANSWER DEPTH & FORMATTING below) — crisp for simple asks, thorough and "
+    "well-explained for anything that wants real understanding.\n\n"
     "APP CAPABILITIES — THIS APP CAN GENERATE MEDIA:\n"
     "- IMAGES: this app HAS built-in image generation via the `/image` slash command "
     "(powered by NVIDIA NIM FLUX). When a user asks you to generate / create / draw / "
@@ -276,6 +304,8 @@ SYSTEM_NORMAL = (
     + CODE_RULE
     + "\n\n"
     + MATH_RULE
+    + "\n\n"
+    + FORMAT_DEPTH_RULE
 )
 
 SYSTEM_RAG = (
@@ -284,13 +314,14 @@ SYSTEM_RAG = (
     "- If the user's message is about the document, answer using the context below — accurately and without making things up.\n"
     "- If the user sends a greeting or a general question unrelated to the document, answer it naturally and helpfully using your own knowledge — do NOT say \"no context\" or refuse.\n"
     "- Interpret technical acronyms in their common technical meaning (e.g. 'RAG' = Retrieval-Augmented Generation).\n"
-    "- Be accurate, clear, and concise.\n"
+    "- Be accurate and clear, with depth calibrated to the question (see ANSWER DEPTH & FORMATTING).\n"
     "- " + LANGUAGE_RULE + "\n\n"
     + INSTRUCTION_FOLLOWING_RULE + "\n\n"
     + ACCURACY_RULE + "\n\n"
     + TEMPORAL_RULE + "\n\n"
     + CODE_RULE + "\n\n"
     + MATH_RULE + "\n\n"
+    + FORMAT_DEPTH_RULE + "\n\n"
     "Document Context:\n{context}"
 )
 
@@ -797,6 +828,67 @@ def _ground_prompt(base_system: str, question: str, history: list, chat_id: str 
 _RAG_MIN_SIMILARITY = 0.3
 
 
+def _safe_metadata_filename(name: str) -> str:
+    """Match upload.py's filename normalization for older saved chat metadata."""
+    base = re.split(r"[\\/]+", str(name or ""))[-1]
+    base = base.replace("\\", "_")
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base).strip("._")
+    return base or "upload.pdf"
+
+
+def _filename_candidates(active_docs: list = None) -> list:
+    """Return both display names and sanitized metadata names for Chroma filters."""
+    seen = set()
+    candidates = []
+    for name in active_docs or []:
+        for candidate in (str(name or "").strip(), _safe_metadata_filename(name)):
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                candidates.append(candidate)
+    return candidates
+
+
+def _empty_query_results() -> dict:
+    return {"documents": [[]], "metadatas": [[]], "embeddings": [[]]}
+
+
+def _query_collection(collection, q_emb: list, n: int, where: dict = None) -> dict:
+    """Query Chroma, retrying without a stale filename filter when needed."""
+    if n <= 0:
+        return _empty_query_results()
+
+    try:
+        results = collection.query(
+            query_embeddings=[q_emb],
+            n_results=n,
+            where=where,
+            include=["documents", "metadatas", "embeddings"],
+        )
+    except Exception:
+        if not where:
+            return _empty_query_results()
+        try:
+            results = collection.query(
+                query_embeddings=[q_emb],
+                n_results=n,
+                include=["documents", "metadatas", "embeddings"],
+            )
+        except Exception:
+            return _empty_query_results()
+
+    documents = (results.get("documents") or [[]])[0]
+    if where and not documents:
+        try:
+            return collection.query(
+                query_embeddings=[q_emb],
+                n_results=n,
+                include=["documents", "metadatas", "embeddings"],
+            )
+        except Exception:
+            return _empty_query_results()
+    return results
+
+
 def _retrieve_relevant(collection, question: str, active_docs: list = None):
     """
     Query the document collection and keep ONLY chunks that are actually similar
@@ -813,13 +905,8 @@ def _retrieve_relevant(collection, question: str, active_docs: list = None):
     # then filter by cosine similarity below, so over-retrieving here is safe
     # and meaningfully boosts recall on multi-section / longer docs.
     n = min(collection.count() or 16, 16)
-    where = {"filename": {"$in": active_docs}} if active_docs else None
-    results = collection.query(
-        query_embeddings=[q_emb],
-        n_results=n,
-        where=where,
-        include=["documents", "metadatas", "embeddings"],
-    )
+    where = {"filename": {"$in": _filename_candidates(active_docs)}} if active_docs else None
+    results = _query_collection(collection, q_emb, n, where)
     documents = results["documents"][0]
     metadatas = results["metadatas"][0]
     embeddings = (results.get("embeddings") or [[]])[0]
@@ -921,6 +1008,28 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _chat_stream_attempts(model: str):
+    """Return provider/model attempts for streaming chat."""
+    if model in (VISION_MODEL, CODE_MODEL):
+        return [(client, model, "nvidia")]
+
+    attempts = []
+    if groq_client is not None:
+        attempts.append((groq_client, model, "groq"))
+    attempts.append((client, NVIDIA_CHAT_MODEL, "nvidia"))
+    return attempts
+
+
+def _log_stream_start_error(provider: str, model: str, exc: Exception) -> None:
+    """Print a useful server-side error without exposing request content or keys."""
+    msg = str(exc).replace("\n", " ")[:500]
+    print(
+        f"Chat stream start failed via {provider} model={model}: "
+        f"{exc.__class__.__name__}: {msg}",
+        flush=True,
+    )
+
+
 def _stream_completion(messages: list, temperature: float, model: str = MODEL):
     """Yield SSE 'token' events from a streaming chat completion.
 
@@ -929,22 +1038,21 @@ def _stream_completion(messages: list, temperature: float, model: str = MODEL):
     that leaves the client with a half-finished response and no signal.
     Uses Groq for chat models (faster) and NVIDIA for vision/code models.
     """
-    # Vision model must stay on NVIDIA (Groq has no vision support).
-    # Code model stays on NVIDIA too — routing by model string is reliable.
-    use_client = (
-        client
-        if model in (VISION_MODEL, CODE_MODEL)
-        else _groq_or_nvidia()
-    )
-    try:
-        stream = use_client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=4096,
-            stream=True,
-        )
-    except Exception:
+    stream = None
+    for attempt_client, attempt_model, provider in _chat_stream_attempts(model):
+        try:
+            stream = attempt_client.chat.completions.create(
+                model=attempt_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=4096,
+                stream=True,
+            )
+            break
+        except Exception as exc:
+            _log_stream_start_error(provider, attempt_model, exc)
+
+    if stream is None:
         yield _sse({"type": "error", "message": "Failed to start the response."})
         return
 

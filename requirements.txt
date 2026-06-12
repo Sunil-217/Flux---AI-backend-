@@ -7,8 +7,8 @@ openai==2.37.0
 chromadb==0.4.24
 langchain-text-splitters==1.1.2
 PyMuPDF==1.27.2.3
-numpy==1.26.4
-pandas==3.0.3
+numpy>=2.3.3
+pandas>=3.0.3
 tavily-python==0.7.25
 SQLAlchemy==2.0.30
 PyJWT==2.13.0
@@ -20,3 +20,5 @@ python-pptx==1.0.2
 markdown==3.7
 xhtml2pdf==0.2.16
 requests==2.32.3
+youtube-transcript-api==1.2.4
+edge-tts==7.2.8

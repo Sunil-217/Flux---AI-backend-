@@ -19,6 +19,10 @@ POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
 # truly-free signup). Get a token at https://huggingface.co/settings/tokens
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 
+# ── Telegram bridge (optional) — when set, main.py starts a daemon polling
+#    thread that answers Telegram messages via the RAG chat pipeline. ──
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
 # ── Auth ──
 _DEFAULT_JWT_SECRET = "dev-secret-change-me-in-production"
 JWT_SECRET = os.getenv("JWT_SECRET", _DEFAULT_JWT_SECRET)

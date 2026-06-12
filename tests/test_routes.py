@@ -23,7 +23,7 @@ def test_chat_streams_events(client, monkeypatch):
     import app.api.routes.chat as chat_route
     from app.services import rag_service
 
-    def fake_stream(chat_id, question, history, image=None):
+    def fake_stream(chat_id, question, history, image=None, *args):
         yield rag_service._sse({"type": "token", "content": "Hi"})
         yield rag_service._sse({"type": "token", "content": " there"})
         yield rag_service._sse({"type": "done"})
@@ -41,7 +41,7 @@ def test_chat_forwards_history(client, monkeypatch):
 
     captured = {}
 
-    def fake_stream(chat_id, question, history, image=None):
+    def fake_stream(chat_id, question, history, image=None, *args):
         captured["history"] = history
         captured["question"] = question
         yield rag_service._sse({"type": "done"})
