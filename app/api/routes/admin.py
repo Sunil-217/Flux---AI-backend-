@@ -337,6 +337,72 @@ def delete_user(
     return {"ok": True, "deleted": target_email}
 
 
+# ── API key management (admin can audit / revoke / delete any user's keys) ─────
+def _key_row(k: ApiKey) -> dict:
+    return {
+        "id": k.id,
+        "name": k.name,
+        "prefix": k.prefix,
+        "revoked": bool(k.revoked),
+        "usage_count": k.usage_count or 0,
+        "total_tokens": k.total_tokens or 0,
+        "created_at": k.created_at.isoformat() if k.created_at else None,
+        "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+    }
+
+
+@router.get("/users/{user_id}/api-keys")
+def user_api_keys(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if db.get(User, user_id) is None:
+        raise HTTPException(404, "User not found.")
+    rows = (
+        db.query(ApiKey)
+        .filter(ApiKey.user_id == user_id)
+        .order_by(ApiKey.created_at.desc())
+        .all()
+    )
+    return {"keys": [_key_row(k) for k in rows]}
+
+
+@router.post("/api-keys/{key_id}/revoke")
+def admin_revoke_key(
+    key_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Disable a key (apps using it stop working) but keep the row for audit."""
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "Key not found.")
+    rec.revoked = True
+    owner = db.get(User, rec.user_id)
+    _record(db, admin, "apikey.revoke", owner, detail=f"key {rec.prefix}")
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/api-keys/{key_id}")
+def admin_delete_key(
+    key_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Permanently remove a key."""
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "Key not found.")
+    owner = db.get(User, rec.user_id)
+    prefix = rec.prefix
+    db.delete(rec)
+    _record(db, admin, "apikey.delete", owner, detail=f"key {prefix}")
+    db.commit()
+    return {"ok": True}
+
+
 # ── Feature flags ────────────────────────────────────────────────────────────
 class FeaturesPatch(BaseModel):
     features: Dict[str, bool]
