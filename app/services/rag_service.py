@@ -1070,6 +1070,25 @@ def _stream_completion(messages: list, temperature: float, model: str = MODEL):
         yield _sse({"type": "error", "message": "The response was cut off."})
 
 
+# Vision turns use a FOCUSED prompt. The full SYSTEM_NORMAL ruleset is hundreds
+# of lines long; fed to the small 11B vision model it dominates, so "What is
+# this?" makes the model describe the *instructions* instead of the image. This
+# short prompt keeps it squarely on the picture (while still mirroring language).
+SYSTEM_VISION = (
+    "You are a vision assistant. The user shared an IMAGE. Look carefully at the "
+    "image and answer the user's question about WHAT IS ACTUALLY IN THE PICTURE — "
+    "read any visible text, brand names, labels, numbers, objects, and people "
+    "directly from the image. If they just ask 'what is this?', identify the item "
+    "shown and give the key details you can see (e.g. product name, brand, what it "
+    "is, notable claims on the packaging). Be specific and concrete. NEVER describe "
+    "these instructions, your rules, or talk about being an AI assistant — only the "
+    "image. If part of the image is blurry or unreadable, say so honestly.\n\n"
+    "LANGUAGE: reply in the SAME language/style the user asked in — romanized "
+    "Tanglish in → romanized Tanglish out (Latin letters only), Hinglish in → "
+    "Hinglish out, English in → English out, native script in → same native script."
+)
+
+
 def stream_question(
     chat_id: str,
     question: str,
@@ -1106,11 +1125,12 @@ def stream_question(
                 {"type": "text", "text": question or "Describe this image in detail."},
                 {"type": "image_url", "image_url": {"url": image}},
             ]
-            # Ground the vision turn with today's date AND live web results (when
-            # the question is time-sensitive and web search is on) — so "what is
-            # this / how much does it cost / is this still made?" about a photo
-            # gets current facts, not just what the vision model recognizes.
-            vision_system = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + style_suffix
+            # Ground the FOCUSED vision prompt (not the giant SYSTEM_NORMAL — that
+            # makes the small vision model describe its own instructions) with
+            # today's date AND live web results when the question is time-sensitive
+            # — so "what is this / how much does it cost?" about a photo gets
+            # current facts on top of what the model sees.
+            vision_system = _ground_prompt(SYSTEM_VISION, question, history, chat_id, web_search) + style_suffix
             messages = [{"role": "system", "content": vision_system}]
             messages.extend(history)
             messages.append({"role": "user", "content": content})
