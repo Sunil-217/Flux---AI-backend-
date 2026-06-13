@@ -1023,7 +1023,7 @@ def _rag_chat(collection, question: str, history: list = [], chat_id: str = None
 
     context, sources = _retrieve_relevant(collection, question)
 
-    rag_system = SYSTEM_RAG.format(context=context)
+    rag_system = SYSTEM_RAG.replace("{context}", context)
     rag_system = _ground_prompt(rag_system, question, history, chat_id)
 
     messages = [{"role": "system", "content": rag_system}]
@@ -1217,7 +1217,7 @@ def stream_question(
                 yield _sse({"type": "sources", "sources": sources})
 
             rag_system = _ground_prompt(
-                SYSTEM_RAG.format(context=context), question, history, chat_id, web_search
+                SYSTEM_RAG.replace("{context}", context), question, history, chat_id, web_search
             ) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": rag_system}]
             messages.extend(history)
