@@ -29,6 +29,12 @@ JWT_SECRET = os.getenv("JWT_SECRET", _DEFAULT_JWT_SECRET)
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", str(60 * 24 * 7)))  # 7 days
 OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "10"))
 
+# ── Admin bootstrap ── comma-separated emails granted platform-admin on startup.
+# These accounts (once signed up + verified) can reach the /admin control panel.
+# Override in production via the ADMIN_EMAILS env var.
+_ADMIN_EMAILS_RAW = os.getenv("ADMIN_EMAILS", "fluxera.noreply@gmail.com")
+ADMIN_EMAILS = {e.strip().lower() for e in _ADMIN_EMAILS_RAW.split(",") if e.strip()}
+
 # ── CORS: comma-separated list of allowed frontend origins ──
 _CORS_DEFAULT = "http://localhost:3000,http://127.0.0.1:3000"
 _CORS_RAW = os.getenv("CORS_ORIGINS", _CORS_DEFAULT)

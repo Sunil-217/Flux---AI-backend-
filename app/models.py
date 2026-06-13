@@ -14,6 +14,11 @@ class User(Base):
     phone = Column(String, nullable=True)
     password_hash = Column(String, nullable=False)
     is_verified = Column(Boolean, default=False, nullable=False)
+    # Platform admin — can reach the /admin/* control panel and manage users.
+    # Bootstrapped from ADMIN_EMAILS at startup (see main.py).
+    is_admin = Column(Boolean, default=False, nullable=False)
+    # Banned users keep their row (for audit) but can't authenticate.
+    is_banned = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -95,3 +100,31 @@ class ApiKey(Base):
     total_tokens = Column(Integer, default=0, nullable=False)  # completion tokens used
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_used_at = Column(DateTime, nullable=True)
+
+
+class FeatureFlag(Base):
+    """A platform-wide feature switch, toggled by admins. Only keys present in
+    DEFAULT_FEATURES are honoured; a missing row means "use the default" (on)."""
+
+    __tablename__ = "feature_flags"
+
+    key = Column(String, primary_key=True)
+    enabled = Column(Boolean, default=True, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AuditLog(Base):
+    """An append-only record of privileged admin actions (who did what, to whom,
+    when). Enterprise requirement and a safety net — every mutating /admin call
+    writes one row so actions are traceable and reversible to investigate."""
+
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, index=True, nullable=False)   # admin who acted
+    actor_email = Column(String, nullable=False)             # denormalised for display
+    action = Column(String, nullable=False)                  # e.g. "user.ban", "user.delete"
+    target_id = Column(Integer, nullable=True)               # affected user id (if any)
+    target_email = Column(String, nullable=True)             # affected user email (if any)
+    detail = Column(Text, nullable=True)                     # free-text / JSON context
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

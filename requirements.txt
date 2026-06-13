@@ -11,6 +11,7 @@ numpy>=2.3.3
 pandas>=3.0.3
 tavily-python==0.7.25
 SQLAlchemy>=2.0.36
+psycopg[binary]>=3.2.3
 PyJWT==2.13.0
 bcrypt==5.0.0
 slowapi==0.1.9

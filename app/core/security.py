@@ -57,6 +57,18 @@ def get_current_user(
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
+    if getattr(user, "is_banned", False):
+        # A banned account keeps its row (for audit) but cannot use the API.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has been suspended.")
+    return user
+
+
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    """FastAPI dependency for /admin/* routes: 403 unless the caller is a
+    platform admin. Layered on get_current_user, so it also enforces a valid,
+    non-banned token first."""
+    if not getattr(user, "is_admin", False):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin access required.")
     return user
 
 

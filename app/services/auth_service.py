@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from app.core.config import OTP_TTL_MINUTES
+from app.core.config import OTP_TTL_MINUTES, ADMIN_EMAILS
 from app.core.security import hash_password, verify_password
 from app.models import User, OtpCode
 from app.services.email_service import send_otp_email
@@ -53,11 +53,18 @@ def signup(db: Session, name: str, email: str, password: str, phone: str) -> Non
     if existing and existing.is_verified:
         raise ValueError("This email is already registered. Please sign in.")
 
+    # A designated admin email becomes admin the moment it signs up — no server
+    # restart / bootstrap pass needed (matters in production where we can't run
+    # a promote script). Other accounts are never auto-admin.
+    is_admin_email = email.lower() in ADMIN_EMAILS
+
     if existing:
         # Unverified account re-registering — refresh details.
         existing.name = name
         existing.phone = phone
         existing.password_hash = hash_password(password)
+        if is_admin_email:
+            existing.is_admin = True
     else:
         db.add(
             User(
@@ -66,6 +73,7 @@ def signup(db: Session, name: str, email: str, password: str, phone: str) -> Non
                 phone=phone,
                 password_hash=hash_password(password),
                 is_verified=False,
+                is_admin=is_admin_email,
             )
         )
     db.commit()
@@ -102,6 +110,8 @@ def signin(db: Session, email: str, password: str) -> User:
     user = db.query(User).filter(User.email == email).first()
     if user is None or not verify_password(password, user.password_hash):
         raise ValueError("Invalid email or password.")
+    if getattr(user, "is_banned", False):
+        raise ValueError("This account has been suspended. Contact support.")
     if not user.is_verified:
         raise ValueError("Please verify your email before signing in.")
     return user

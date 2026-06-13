@@ -44,7 +44,13 @@ class ResetRequest(BaseModel):
 
 
 def _user_out(user: User) -> dict:
-    return {"id": user.id, "name": user.name, "email": user.email, "phone": user.phone}
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "is_admin": bool(getattr(user, "is_admin", False)),
+    }
 
 
 def _token_response(user: User) -> dict:

@@ -11,3 +11,7 @@ node_modules/
 uploads/
 
 *.pyc
+
+# Local SQLite database — never commit (prod uses PostgreSQL via DATABASE_URL).
+*.db
+flux_ai.db
