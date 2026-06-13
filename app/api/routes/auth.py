@@ -104,7 +104,13 @@ def signin(request: Request, req: SigninRequest, db: Session = Depends(get_db)):
 @router.post("/forgot-password")
 @limiter.limit("3/minute")
 def forgot_password(request: Request, req: ForgotRequest, db: Session = Depends(get_db)):
-    auth_service.request_password_reset(db, req.email.lower())
+    # Stay generic AND never 500 (a raw 500 strips CORS headers → the browser
+    # shows a confusing "CORS blocked" instead of a real error). Email-send
+    # failures are swallowed here; the user just retries.
+    try:
+        auth_service.request_password_reset(db, req.email.lower())
+    except Exception:
+        pass
     # Always generic — never reveal whether the email is registered.
     return {"message": "If an account exists for this email, a reset code has been sent."}
 
