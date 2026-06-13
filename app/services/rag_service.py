@@ -130,6 +130,23 @@ LANGUAGE_RULE = (
     "rather than only asking for clarification."
 )
 
+# Short, forceful recency reminder appended to the VERY END of every system
+# prompt (after the long rules + web context). llama models "lose" instructions
+# buried mid-prompt; putting the language mirror LAST — right before the user's
+# message — makes Tanglish/Hinglish replies dramatically more reliable.
+LANGUAGE_REMINDER = (
+    "\n\nFINAL REMINDER (highest priority — overrides formatting/verbosity rules): "
+    "Reply in the SAME language and script as the user's LATEST message. English in "
+    "→ English out. If they wrote romanized Tamil / Tanglish (Tamil words in English "
+    "letters — e.g. 'enna da', 'epdi pannrathu', 'code venum da', 'explain pannu', "
+    "'idhu enna', 'seri va'), reply in natural, fluent romanized Tanglish using ONLY "
+    "English letters — NEVER Tamil script, and NEVER switch to plain English. "
+    "Hinglish in → Hinglish out. Mirror the user's casual tone and code-switching, "
+    "and treat casual particles (da, machi, tha, dhaan, pannu, venum, kudu, enna, "
+    "yaaru, epdi, ha, aa, seri, illa, romba) as normal informal speech — infer "
+    "intent and answer helpfully; NEVER say they're unclear or ask what they mean."
+)
+
 # Accuracy + reasoning rule — pushes the model to think carefully on hard
 # questions and be honest about uncertainty rather than guess.
 ACCURACY_RULE = (
@@ -1130,7 +1147,7 @@ def stream_question(
             # today's date AND live web results when the question is time-sensitive
             # — so "what is this / how much does it cost?" about a photo gets
             # current facts on top of what the model sees.
-            vision_system = _ground_prompt(SYSTEM_VISION, question, history, chat_id, web_search) + style_suffix
+            vision_system = _ground_prompt(SYSTEM_VISION, question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": vision_system}]
             messages.extend(history)
             messages.append({"role": "user", "content": content})
@@ -1141,7 +1158,7 @@ def stream_question(
         collection = get_or_create_collection(chat_id)
 
         if collection.count() == 0:
-            system_prompt = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + style_suffix
+            system_prompt = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(history)
             messages.append({"role": "user", "content": question})
@@ -1158,7 +1175,7 @@ def stream_question(
 
             rag_system = _ground_prompt(
                 SYSTEM_RAG.format(context=context), question, history, chat_id, web_search
-            ) + style_suffix
+            ) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": rag_system}]
             messages.extend(history)
             messages.append({"role": "user", "content": question})
