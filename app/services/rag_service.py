@@ -472,31 +472,56 @@ def generate_followups(question: str, answer: str) -> list:
         return []
 
 
+def _chat_complete(messages: list, temperature: float = 0.3, max_tokens: int = 1024) -> str:
+    """Non-streaming chat completion with automatic Groq → NVIDIA fallback.
+
+    Groq is faster, but if its key is invalid / rate-limited / down (HTTP 401,
+    429, 5xx), retry on the NVIDIA-hosted equivalent so user-facing features
+    (translate, summary, …) keep working instead of silently returning empty.
+    """
+    attempts = []
+    if groq_client is not None:
+        attempts.append((groq_client, MODEL, "groq"))
+    attempts.append((client, NVIDIA_CHAT_MODEL, "nvidia"))
+    last_exc = None
+    for attempt_client, attempt_model, provider in attempts:
+        try:
+            resp = attempt_client.chat.completions.create(
+                model=attempt_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            if out:
+                return out
+        except Exception as exc:  # noqa: BLE001 — try the next provider
+            last_exc = exc
+            print(f"_chat_complete failed via {provider} ({attempt_model}): {exc}", flush=True)
+            continue
+    return ""
+
+
 def translate_text(text: str, language: str) -> str:
-    """Translate text into the target language."""
-    try:
-        resp = _groq_or_nvidia().chat.completions.create(
-            model=MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"Translate the user's text into {language}. Output ONLY the translation, "
-                        "preserving meaning, tone, and any markdown/code formatting. Add no notes."
-                    ),
-                },
-                {"role": "user", "content": text[:4000]},
-            ],
-            temperature=0.3,
-            max_tokens=2000,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return ""
+    """Translate text into the target language (Groq, NVIDIA fallback)."""
+    return _chat_complete(
+        [
+            {
+                "role": "system",
+                "content": (
+                    f"Translate the user's text into {language}. Output ONLY the translation, "
+                    "preserving meaning, tone, and any markdown/code formatting. Add no notes."
+                ),
+            },
+            {"role": "user", "content": text[:4000]},
+        ],
+        temperature=0.3,
+        max_tokens=2000,
+    )
 
 
 def summarize_conversation(history: list) -> str:
-    """Produce a concise markdown summary of a conversation."""
+    """Produce a concise markdown summary of a conversation (Groq, NVIDIA fallback)."""
     if not history:
         return ""
     transcript = "\n\n".join(
@@ -504,26 +529,21 @@ def summarize_conversation(history: list) -> str:
         for m in history
         if m.get("content")
     )[:12000]
-    try:
-        resp = _groq_or_nvidia().chat.completions.create(
-            model=MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Summarize the following conversation concisely in markdown. Start with a "
-                        "one-line TL;DR, then 3-6 bullet points of the key topics, decisions, and "
-                        "any action items or open questions. Be faithful; add nothing not discussed."
-                    ),
-                },
-                {"role": "user", "content": transcript},
-            ],
-            temperature=0.3,
-            max_tokens=900,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return ""
+    return _chat_complete(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize the following conversation concisely in markdown. Start with a "
+                    "one-line TL;DR, then 3-6 bullet points of the key topics, decisions, and "
+                    "any action items or open questions. Be faithful; add nothing not discussed."
+                ),
+            },
+            {"role": "user", "content": transcript},
+        ],
+        temperature=0.3,
+        max_tokens=900,
+    )
 
 
 def _strip_code_output(out: str) -> str:
