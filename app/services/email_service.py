@@ -31,11 +31,11 @@ def _send_via(host: str, port: int, user: str, pwd: str, msg: EmailMessage) -> N
     """Send through one host:port. Port 465 = implicit SSL; others = STARTTLS.
     Short timeout so a blocked port fails fast and we can try the next one."""
     if int(port) == 465:
-        with smtplib.SMTP_SSL(host, port, timeout=12) as server:
+        with smtplib.SMTP_SSL(host, port, timeout=6) as server:
             server.login(user, pwd)
             server.send_message(msg)
     else:
-        with smtplib.SMTP(host, port, timeout=12) as server:
+        with smtplib.SMTP(host, port, timeout=6) as server:
             server.ehlo()
             server.starttls()
             server.ehlo()

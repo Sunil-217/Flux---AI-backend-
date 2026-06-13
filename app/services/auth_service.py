@@ -2,13 +2,13 @@
 
 import secrets
 from datetime import datetime, timedelta
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from app.core.config import OTP_TTL_MINUTES, ADMIN_EMAILS
 from app.core.security import hash_password, verify_password
 from app.models import User, OtpCode
-from app.services.email_service import send_otp_email
 
 # After this many wrong guesses the code is invalidated and a new one must be
 # requested — so a 6-digit code can't be brute-forced within its TTL window.
@@ -33,7 +33,10 @@ def _check_code_or_raise(db, rec, code: str, wrong_msg: str) -> None:
         raise ValueError(wrong_msg)
 
 
-def issue_otp(db: Session, email: str) -> None:
+def issue_otp(db: Session, email: str) -> str:
+    """Create a fresh OTP record and RETURN the code. Delivery is the caller's
+    job — endpoints send it in a FastAPI background task so the request never
+    blocks on SMTP (a slow/blocked mail server can't 502 the signup anymore)."""
     code = _generate_otp()
     db.query(OtpCode).filter(OtpCode.email == email).delete()
     db.add(
@@ -44,14 +47,15 @@ def issue_otp(db: Session, email: str) -> None:
         )
     )
     db.commit()
-    send_otp_email(email, code)
+    return code
 
 
 def signup(db: Session, name: str, email: str, password: str, phone: str):
-    """Returns (user, auto_verified). For a designated admin email the account is
-    created admin AND verified with NO OTP/email step (auto_verified=True), so the
-    critical admin login never depends on email delivery. Everyone else gets the
-    normal OTP-by-email flow (auto_verified=False)."""
+    """Returns (user, auto_verified, otp_code). For a designated admin email the
+    account is created admin AND verified with NO OTP (auto_verified=True,
+    code=None), so the critical admin login never depends on email. Everyone else
+    gets an OTP code back (auto_verified=False) which the endpoint emails in the
+    background."""
     existing = db.query(User).filter(User.email == email).first()
 
     if existing and existing.is_verified:
@@ -84,9 +88,9 @@ def signup(db: Session, name: str, email: str, password: str, phone: str):
     db.refresh(user)
 
     if is_admin_email:
-        return user, True  # skip OTP entirely for the admin
-    issue_otp(db, email)
-    return user, False
+        return user, True, None  # skip OTP entirely for the admin
+    code = issue_otp(db, email)
+    return user, False, code
 
 
 def verify_otp(db: Session, email: str, code: str) -> User:
@@ -106,13 +110,13 @@ def verify_otp(db: Session, email: str, code: str) -> User:
     return user
 
 
-def resend_otp(db: Session, email: str) -> None:
+def resend_otp(db: Session, email: str) -> str:
     user = db.query(User).filter(User.email == email).first()
     if user is None:
         raise ValueError("No sign-up found for this email.")
     if user.is_verified:
         raise ValueError("This email is already verified. Please sign in.")
-    issue_otp(db, email)
+    return issue_otp(db, email)
 
 
 def signin(db: Session, email: str, password: str) -> User:
@@ -126,12 +130,14 @@ def signin(db: Session, email: str, password: str) -> User:
     return user
 
 
-def request_password_reset(db: Session, email: str) -> None:
-    """Send a reset code if a verified account exists. Stays silent either way
-    (so we never reveal whether an email is registered)."""
+def request_password_reset(db: Session, email: str) -> Optional[str]:
+    """Return a reset code if a verified account exists, else None. The endpoint
+    emails it (in the background) and stays generic either way, so we never reveal
+    whether an email is registered."""
     user = db.query(User).filter(User.email == email).first()
     if user is not None and user.is_verified:
-        issue_otp(db, email)
+        return issue_otp(db, email)
+    return None
 
 
 def reset_password(db: Session, email: str, code: str, new_password: str) -> User:

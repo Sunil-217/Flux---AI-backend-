@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -7,6 +7,7 @@ from app.core.security import create_access_token, get_current_user
 from app.core.rate_limit import limiter
 from app.models import User
 from app.services import auth_service
+from app.services.email_service import send_otp_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -63,13 +64,18 @@ def _token_response(user: User) -> dict:
 
 @router.post("/signup")
 @limiter.limit("5/minute")
-def signup(request: Request, req: SignupRequest, db: Session = Depends(get_db)):
+def signup(
+    request: Request,
+    req: SignupRequest,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     if len(req.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
     if not req.name.strip():
         raise HTTPException(400, "Name is required.")
     try:
-        user, auto_verified = auth_service.signup(
+        user, auto_verified, code = auth_service.signup(
             db, req.name.strip(), req.email.lower(), req.password, req.phone.strip()
         )
     except ValueError as exc:
@@ -77,6 +83,9 @@ def signup(request: Request, req: SignupRequest, db: Session = Depends(get_db)):
     if auto_verified:
         # Designated admin — verified on creation, log in immediately (no OTP).
         return {"auto_login": True, **_token_response(user)}
+    # Email the code in the background so SMTP latency never blocks/502s signup.
+    if code:
+        background.add_task(send_otp_email, req.email.lower(), code)
     return {"message": "Verification code sent to your email.", "email": req.email.lower()}
 
 
@@ -92,11 +101,17 @@ def verify_otp(request: Request, req: VerifyRequest, db: Session = Depends(get_d
 
 @router.post("/resend-otp")
 @limiter.limit("3/minute")
-def resend_otp(request: Request, req: ResendRequest, db: Session = Depends(get_db)):
+def resend_otp(
+    request: Request,
+    req: ResendRequest,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     try:
-        auth_service.resend_otp(db, req.email.lower())
+        code = auth_service.resend_otp(db, req.email.lower())
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    background.add_task(send_otp_email, req.email.lower(), code)
     return {"message": "A new verification code was sent to your email."}
 
 
@@ -112,12 +127,19 @@ def signin(request: Request, req: SigninRequest, db: Session = Depends(get_db)):
 
 @router.post("/forgot-password")
 @limiter.limit("3/minute")
-def forgot_password(request: Request, req: ForgotRequest, db: Session = Depends(get_db)):
+def forgot_password(
+    request: Request,
+    req: ForgotRequest,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     # Stay generic AND never 500 (a raw 500 strips CORS headers → the browser
-    # shows a confusing "CORS blocked" instead of a real error). Email-send
-    # failures are swallowed here; the user just retries.
+    # shows a confusing "CORS blocked" instead of a real error). The email send
+    # is backgrounded so SMTP latency never blocks the response.
     try:
-        auth_service.request_password_reset(db, req.email.lower())
+        code = auth_service.request_password_reset(db, req.email.lower())
+        if code:
+            background.add_task(send_otp_email, req.email.lower(), code)
     except Exception:
         pass
     # Always generic — never reveal whether the email is registered.
