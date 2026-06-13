@@ -5,11 +5,12 @@ chunk_text → create_embeddings → collection.add into the chat's Chroma
 collection, so the existing RAG pipeline answers questions about them.
 """
 
+import os
 import re
 import uuid
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -317,3 +318,108 @@ async def upload_github(
         raise HTTPException(status_code=500, detail="Failed to index the repository. Please try again.")
 
     return {"source": source, "files": files}
+
+
+# ── Feature: Video / audio chat ──────────────────────────────────────────────
+# A user uploads a video (or audio) file; we transcribe its speech with Groq's
+# whisper-large-v3 and index the transcript like any other source, so the RAG
+# pipeline answers questions about what was said in the video.
+#
+# Note: this captures SPOKEN content (the audio track). Purely visual content
+# with no narration won't be transcribed. Groq's transcription endpoint accepts
+# common video/audio containers directly (incl. .mp4) — no ffmpeg needed.
+
+_VIDEO_AUDIO_EXTS = (
+    ".mp4", ".mov", ".webm", ".mkv", ".avi",        # video containers
+    ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".mpeg", ".mpga",  # audio
+)
+
+# Groq's transcription free tier caps uploads at 25 MB. Keep our own guard a
+# touch under that so we reject with a friendly message before the API does.
+MAX_VIDEO_BYTES = 25 * 1024 * 1024
+
+
+def _transcribe_audio(filename: str, content: bytes) -> str:
+    """Transcribe a video/audio file's speech via Groq whisper-large-v3.
+    Imported lazily so a missing GROQ key never breaks module import."""
+    from app.services.rag_service import groq_client
+
+    if groq_client is None:
+        raise RuntimeError("transcription-unavailable")
+
+    resp = groq_client.audio.transcriptions.create(
+        model="whisper-large-v3",
+        file=(filename, content),
+    )
+    return (getattr(resp, "text", None) or "").strip()
+
+
+@router.post("/upload-video")
+async def upload_video(
+    file: UploadFile = File(...),
+    chat_id: str = Form(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Transcribe an uploaded video/audio file and index it for Q&A."""
+    if not user_owns_chat(db, user, chat_id):
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    filename = os.path.basename(file.filename or "video.mp4")
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in _VIDEO_AUDIO_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file. Upload a video (.mp4, .mov, .webm) or audio (.mp3, .m4a, .wav) file.",
+        )
+
+    # Read with a hard cap so a huge upload can't exhaust memory.
+    buf = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > MAX_VIDEO_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum is {MAX_VIDEO_BYTES // (1024 * 1024)} MB "
+                "(trim the clip or upload audio only).",
+            )
+    content = bytes(buf)
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    try:
+        transcript = await run_in_threadpool(_transcribe_audio, filename, content)
+    except RuntimeError:
+        raise HTTPException(
+            status_code=503,
+            detail="Transcription isn't configured on the server (GROQ_API_KEY missing).",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't transcribe that file. Try a shorter clip or a different format.",
+        )
+
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="No speech was detected in that file, so there's nothing to index.",
+        )
+
+    chunks = chunk_text(transcript)
+    try:
+        await run_in_threadpool(
+            _ingest,
+            chat_id,
+            sanitize_chat_id(chat_id),
+            filename,
+            chunks,
+            {"source": "video"},
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to index the transcript. Please try again.")
+
+    return {"source": filename, "chars": len(transcript)}

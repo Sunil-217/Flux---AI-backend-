@@ -1106,7 +1106,11 @@ def stream_question(
                 {"type": "text", "text": question or "Describe this image in detail."},
                 {"type": "image_url", "image_url": {"url": image}},
             ]
-            vision_system = SYSTEM_NORMAL + f"\n\nToday's real date is {_today_str()}." + style_suffix
+            # Ground the vision turn with today's date AND live web results (when
+            # the question is time-sensitive and web search is on) — so "what is
+            # this / how much does it cost / is this still made?" about a photo
+            # gets current facts, not just what the vision model recognizes.
+            vision_system = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + style_suffix
             messages = [{"role": "system", "content": vision_system}]
             messages.extend(history)
             messages.append({"role": "user", "content": content})
