@@ -47,15 +47,18 @@ def issue_otp(db: Session, email: str) -> None:
     send_otp_email(email, code)
 
 
-def signup(db: Session, name: str, email: str, password: str, phone: str) -> None:
+def signup(db: Session, name: str, email: str, password: str, phone: str):
+    """Returns (user, auto_verified). For a designated admin email the account is
+    created admin AND verified with NO OTP/email step (auto_verified=True), so the
+    critical admin login never depends on email delivery. Everyone else gets the
+    normal OTP-by-email flow (auto_verified=False)."""
     existing = db.query(User).filter(User.email == email).first()
 
     if existing and existing.is_verified:
         raise ValueError("This email is already registered. Please sign in.")
 
-    # A designated admin email becomes admin the moment it signs up — no server
-    # restart / bootstrap pass needed (matters in production where we can't run
-    # a promote script). Other accounts are never auto-admin.
+    # A designated admin email becomes admin (and verified) the moment it signs
+    # up — no restart, no bootstrap pass, no email round-trip needed.
     is_admin_email = email.lower() in ADMIN_EMAILS
 
     if existing:
@@ -65,19 +68,25 @@ def signup(db: Session, name: str, email: str, password: str, phone: str) -> Non
         existing.password_hash = hash_password(password)
         if is_admin_email:
             existing.is_admin = True
+            existing.is_verified = True
+        user = existing
     else:
-        db.add(
-            User(
-                name=name,
-                email=email,
-                phone=phone,
-                password_hash=hash_password(password),
-                is_verified=False,
-                is_admin=is_admin_email,
-            )
+        user = User(
+            name=name,
+            email=email,
+            phone=phone,
+            password_hash=hash_password(password),
+            is_verified=is_admin_email,  # admins are verified on creation
+            is_admin=is_admin_email,
         )
+        db.add(user)
     db.commit()
+    db.refresh(user)
+
+    if is_admin_email:
+        return user, True  # skip OTP entirely for the admin
     issue_otp(db, email)
+    return user, False
 
 
 def verify_otp(db: Session, email: str, code: str) -> User:

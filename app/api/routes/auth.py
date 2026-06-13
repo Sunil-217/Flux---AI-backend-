@@ -69,11 +69,14 @@ def signup(request: Request, req: SignupRequest, db: Session = Depends(get_db)):
     if not req.name.strip():
         raise HTTPException(400, "Name is required.")
     try:
-        auth_service.signup(
+        user, auto_verified = auth_service.signup(
             db, req.name.strip(), req.email.lower(), req.password, req.phone.strip()
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    if auto_verified:
+        # Designated admin — verified on creation, log in immediately (no OTP).
+        return {"auto_login": True, **_token_response(user)}
     return {"message": "Verification code sent to your email.", "email": req.email.lower()}
 
 
