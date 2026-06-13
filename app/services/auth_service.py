@@ -1,5 +1,7 @@
 """Sign-up / OTP-verify / sign-in business logic."""
 
+import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional
@@ -20,6 +22,17 @@ def _generate_otp() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
 
 
+def _hash_otp(code: str) -> str:
+    """OTPs are short-lived 6-digit codes guarded by a TTL + attempt limit, so a
+    fast SHA-256 is the right tool — bcrypt here just made signup/verify slow on
+    constrained hosts (two bcrypt hashes per signup) for no security gain."""
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _verify_otp_hash(code: str, stored: str) -> bool:
+    return hmac.compare_digest(_hash_otp(code), stored)
+
+
 def _check_code_or_raise(db, rec, code: str, wrong_msg: str) -> None:
     """Validate a code against an OTP record, enforcing an attempt limit.
     Raises ValueError on any failure (and counts/locks wrong guesses)."""
@@ -27,7 +40,7 @@ def _check_code_or_raise(db, rec, code: str, wrong_msg: str) -> None:
         db.query(OtpCode).filter(OtpCode.email == rec.email).delete()
         db.commit()
         raise ValueError("Too many incorrect attempts. Please request a new code.")
-    if not verify_password(code, rec.code_hash):
+    if not _verify_otp_hash(code, rec.code_hash):
         rec.attempts = (rec.attempts or 0) + 1
         db.commit()
         raise ValueError(wrong_msg)
@@ -42,7 +55,7 @@ def issue_otp(db: Session, email: str) -> str:
     db.add(
         OtpCode(
             email=email,
-            code_hash=hash_password(code),
+            code_hash=_hash_otp(code),
             expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MINUTES),
         )
     )
