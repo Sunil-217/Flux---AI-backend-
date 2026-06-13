@@ -259,11 +259,10 @@ def _html_escape(s: str) -> str:
 def generate_document_pdf(prompt: str) -> tuple[str, bytes]:
     """Pipeline: prompt -> LLM writes Markdown -> we render the PDF. Returns (title, bytes)."""
     # Lazy import so this module doesn't pull rag_service at process start.
-    from app.services.rag_service import client, MODEL
+    from app.services.rag_service import _chat_complete
 
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
+    _out = _chat_complete(
+        [
             {
                 "role": "system",
                 "content": (
@@ -292,7 +291,7 @@ def generate_document_pdf(prompt: str) -> tuple[str, bytes]:
         temperature=0.35,
         max_tokens=4096,
     )
-    md = (resp.choices[0].message.content or "").strip()
+    md = (_out or "").strip()
 
     # Strip accidental ``` fences around the whole doc.
     if md.startswith("```"):
@@ -375,11 +374,10 @@ def _build_excel(title: str, headers: list, rows: list) -> bytes:
 def generate_document_excel(prompt: str) -> tuple[str, bytes]:
     """Pipeline: prompt → LLM writes table JSON → openpyxl → .xlsx bytes."""
     import json as _json
-    from app.services.rag_service import client, MODEL
+    from app.services.rag_service import _chat_complete
 
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
+    _out = _chat_complete(
+        [
             {
                 "role": "system",
                 "content": (
@@ -401,7 +399,7 @@ def generate_document_excel(prompt: str) -> tuple[str, bytes]:
         temperature=0.2,
         max_tokens=3000,
     )
-    raw = (resp.choices[0].message.content or "").strip()
+    raw = (_out or "").strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
         lines = lines[1:] if lines[0].startswith("```") else lines
@@ -540,11 +538,10 @@ def _md_to_docx(title: str, body: str) -> bytes:
 
 def generate_document_word(prompt: str) -> tuple[str, bytes]:
     """Pipeline: prompt → LLM writes Markdown → python-docx → .docx bytes."""
-    from app.services.rag_service import client, MODEL
+    from app.services.rag_service import _chat_complete
 
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
+    _out = _chat_complete(
+        [
             {
                 "role": "system",
                 "content": (
@@ -565,7 +562,7 @@ def generate_document_word(prompt: str) -> tuple[str, bytes]:
         temperature=0.35,
         max_tokens=4096,
     )
-    md = (resp.choices[0].message.content or "").strip()
+    md = (_out or "").strip()
     if md.startswith("```"):
         lines = md.split("\n")
         lines = lines[1:] if lines[0].startswith("```") else lines
@@ -634,11 +631,10 @@ def _build_ppt(title: str, slides_data: list) -> bytes:
 def generate_document_ppt(prompt: str) -> tuple[str, bytes]:
     """Pipeline: prompt → LLM writes slide JSON → python-pptx → .pptx bytes."""
     import json as _json
-    from app.services.rag_service import client, MODEL
+    from app.services.rag_service import _chat_complete
 
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
+    _out = _chat_complete(
+        [
             {
                 "role": "system",
                 "content": (
@@ -659,7 +655,7 @@ def generate_document_ppt(prompt: str) -> tuple[str, bytes]:
         temperature=0.3,
         max_tokens=2000,
     )
-    raw = (resp.choices[0].message.content or "").strip()
+    raw = (_out or "").strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
         lines = lines[1:] if lines[0].startswith("```") else lines

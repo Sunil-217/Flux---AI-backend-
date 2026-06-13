@@ -38,7 +38,7 @@ router = APIRouter()
 UPLOAD_DIR = "uploads"
 
 ALLOWED_EXTENSIONS = [
-    ".pdf", ".docx", ".txt", ".md", ".csv", ".json",
+    ".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv", ".json",
     ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css",
     ".java", ".c", ".cpp", ".h", ".go", ".rs", ".rb", ".php",
     ".sh", ".yaml", ".yml", ".xml", ".sql",
@@ -109,7 +109,7 @@ async def upload_file(
     if file_extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file type. Allowed: PDF, Word (.docx), text, markdown, CSV, and code files.",
+            detail="Unsupported file type. Allowed: PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), text, markdown, CSV, JSON, and code files.",
         )
 
     content = await _read_capped(file)

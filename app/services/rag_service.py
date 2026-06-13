@@ -254,6 +254,26 @@ FORMAT_DEPTH_RULE = (
     "detailed Tanglish answer is detailed AND in Tanglish."
 )
 
+# The app renders ```mermaid blocks as real diagrams (see MermaidBlock), so the
+# model must emit VALID mermaid for any diagram request — never ASCII art.
+DIAGRAM_RULE = (
+    "DIAGRAMS & FLOWCHARTS:\n"
+    "- When the user asks for a flowchart, flow diagram, process flow, architecture diagram, "
+    "sequence diagram, mind map, ER diagram, or any visual diagram — output it as a VALID "
+    "Mermaid code block: a line with ```mermaid, then the diagram, then a closing ```. The app "
+    "renders it as a real picture. NEVER use ASCII art for diagrams.\n"
+    "- Pick the correct Mermaid type: 'flowchart TD' (top-down) or 'flowchart LR' (left-right) for "
+    "flows/processes; 'sequenceDiagram' for interactions; 'classDiagram', 'erDiagram', 'mindmap', "
+    "or 'gantt' when they fit.\n"
+    "- SYNTAX MUST BE VALID (mermaid is strict): one statement per line; node ids are simple "
+    "alphanumerics (A, B, step1); arrows are --> (or -->|label|); put display text in brackets "
+    "like A[Start]. If a label has spaces or punctuation, WRAP IT IN DOUBLE QUOTES: "
+    "A[\"Validate input\"] --> B{\"Valid?\"}. Avoid raw parentheses, slashes, semicolons, or "
+    "unquoted special characters inside labels — they break the parser.\n"
+    "- Keep diagrams clean (typically 4-12 nodes). Add a one-line explanation before or after if "
+    "it helps, but the diagram itself is the answer."
+)
+
 # Optional response-style presets the user can pick in Settings. Appended to the
 # system prompt at request time so they steer tone WITHOUT overriding accuracy.
 STYLE_RULES = {
@@ -323,6 +343,8 @@ SYSTEM_NORMAL = (
     + MATH_RULE
     + "\n\n"
     + FORMAT_DEPTH_RULE
+    + "\n\n"
+    + DIAGRAM_RULE
 )
 
 SYSTEM_RAG = (
@@ -339,6 +361,7 @@ SYSTEM_RAG = (
     + CODE_RULE + "\n\n"
     + MATH_RULE + "\n\n"
     + FORMAT_DEPTH_RULE + "\n\n"
+    + DIAGRAM_RULE + "\n\n"
     "Document Context:\n{context}"
 )
 
