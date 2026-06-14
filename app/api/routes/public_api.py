@@ -26,7 +26,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.routes.apikeys import hash_key
 from app.db import get_db
-from app.models import ApiKey
+from app.models import ApiKey, User
 from app.services.rag_service import (
     MODEL,
     CODE_MODEL,
@@ -71,6 +71,10 @@ def require_api_key(
     rec = db.query(ApiKey).filter(ApiKey.key_hash == hash_key(raw)).first()
     if rec is None or rec.revoked:
         raise HTTPException(401, "Invalid or revoked API key.")
+    # The key owner can be blocked from the API (or banned entirely) by an admin.
+    owner = db.get(User, rec.user_id)
+    if owner is None or getattr(owner, "api_blocked", False) or getattr(owner, "is_banned", False):
+        raise HTTPException(403, "API access for this account has been blocked.")
     _check_rate(rec.id)
     return rec
 

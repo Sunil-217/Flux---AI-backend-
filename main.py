@@ -43,6 +43,7 @@ def _ensure_schema():
         ("otp_codes", "attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("users", "is_admin", "BOOLEAN NOT NULL DEFAULT 0"),
         ("users", "is_banned", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("users", "api_blocked", "BOOLEAN NOT NULL DEFAULT 0"),
     ]
     try:
         insp = inspect(engine)

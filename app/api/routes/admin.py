@@ -107,6 +107,7 @@ def _user_row(u: User, chat_count: int = 0, key_count: int = 0) -> dict:
         "is_verified": bool(u.is_verified),
         "is_admin": bool(getattr(u, "is_admin", False)),
         "is_banned": bool(getattr(u, "is_banned", False)),
+        "api_blocked": bool(getattr(u, "api_blocked", False)),
         "is_protected": _is_protected(u.email),
         "created_at": u.created_at.isoformat() if u.created_at else None,
         "chat_count": chat_count,
@@ -303,6 +304,7 @@ class UpdateUserRequest(BaseModel):
     is_verified: Optional[bool] = None
     is_admin: Optional[bool] = None
     is_banned: Optional[bool] = None
+    api_blocked: Optional[bool] = None
 
 
 @router.patch("/users/{user_id}")
@@ -339,6 +341,17 @@ def update_user(
         u.is_banned = req.is_banned
         changes.append("ban" if req.is_banned else "unban")
         _record(db, admin, "user.ban" if req.is_banned else "user.unban", u)
+
+    # ── Block / unblock API access ──
+    if req.api_blocked is not None and bool(getattr(u, "api_blocked", False)) != req.api_blocked:
+        u.api_blocked = req.api_blocked
+        if req.api_blocked:
+            # Blocking also revokes every existing key so it stops working now.
+            db.query(ApiKey).filter(ApiKey.user_id == u.id, ApiKey.revoked == False).update(  # noqa: E712
+                {ApiKey.revoked: True}
+            )
+        changes.append("api_block" if req.api_blocked else "api_unblock")
+        _record(db, admin, "apikey.block_user" if req.api_blocked else "apikey.unblock_user", u)
 
     if changes:
         db.commit()

@@ -64,6 +64,8 @@ def create_key(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if getattr(user, "api_blocked", False):
+        raise HTTPException(403, "API access for your account has been disabled by an administrator.")
     active = (
         db.query(ApiKey)
         .filter(ApiKey.user_id == user.id, ApiKey.revoked == False)  # noqa: E712

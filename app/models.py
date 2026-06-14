@@ -19,6 +19,10 @@ class User(Base):
     is_admin = Column(Boolean, default=False, nullable=False)
     # Banned users keep their row (for audit) but can't authenticate.
     is_banned = Column(Boolean, default=False, nullable=False)
+    # Blocked from the developer API: existing keys stop working and no new keys
+    # can be created. Independent of is_banned (a user can keep app access but
+    # lose API access).
+    api_blocked = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
