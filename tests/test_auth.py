@@ -163,3 +163,36 @@ def test_reset_password_wrong_code(client):
         json={"email": SIGNUP["email"], "code": "000000", "new_password": "newsecret456"},
     )
     assert r.status_code == 400
+
+
+# ── Admin self-heal (ADMIN_EMAILS) ──
+def test_designated_admin_self_heals_on_signin_and_me(client, monkeypatch):
+    """An account whose email is in ADMIN_EMAILS but was created without admin
+    rights gets promoted on its next sign-in / /me — no restart needed."""
+    from app.services import auth_service
+
+    # 1. Sign up + verify as a PLAIN user (SIGNUP email isn't an admin email yet).
+    _signup_and_verify(client)
+    r = client.post("/auth/signin", json={"email": SIGNUP["email"], "password": SIGNUP["password"]})
+    assert r.json()["user"]["is_admin"] is False  # plain user at this point
+
+    # 2. Designate that email as admin AFTER the account exists (simulates adding
+    #    it to ADMIN_EMAILS, or shipping the admin feature, post-signup).
+    monkeypatch.setattr(auth_service, "ADMIN_EMAILS", {SIGNUP["email"]})
+
+    # 3. Sign in again → promoted, and the token response reflects it.
+    r = client.post("/auth/signin", json={"email": SIGNUP["email"], "password": SIGNUP["password"]})
+    assert r.status_code == 200
+    assert r.json()["user"]["is_admin"] is True
+    token = r.json()["access_token"]
+
+    # 4. /me also reports admin (a plain page refresh is enough).
+    r = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert r.json()["is_admin"] is True
+
+
+def test_non_admin_is_not_promoted(client):
+    """A normal account is never silently promoted."""
+    _signup_and_verify(client)
+    r = client.post("/auth/signin", json={"email": SIGNUP["email"], "password": SIGNUP["password"]})
+    assert r.json()["user"]["is_admin"] is False

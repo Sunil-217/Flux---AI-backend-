@@ -172,7 +172,11 @@ def reset_password(request: Request, req: ResetRequest, db: Session = Depends(ge
 
 
 @router.get("/me")
-def me(user: User = Depends(get_current_user)):
+def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Self-heal admin rights: a designated ADMIN_EMAILS account is promoted on
+    # its next session check, so an already-logged-in admin only needs to
+    # refresh — no re-login or backend restart required.
+    user = auth_service.ensure_admin_status(db, user)
     return _user_out(user)
 
 

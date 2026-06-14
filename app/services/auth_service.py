@@ -174,6 +174,23 @@ def resend_otp(db: Session, email: str) -> str:
     return issue_otp(db, email)
 
 
+def ensure_admin_status(db: Session, user: User) -> User:
+    """Self-heal admin rights: if this user's email is designated in
+    ADMIN_EMAILS but the row isn't admin yet, promote it now. This removes the
+    dependence on the startup bootstrap pass — an account added to ADMIN_EMAILS
+    (or created before the admin feature shipped) becomes admin on its next
+    sign-in / session check, with no restart needed. No-op otherwise."""
+    if user is None:
+        return user
+    if (user.email or "").lower() in ADMIN_EMAILS and not getattr(user, "is_admin", False):
+        user.is_admin = True
+        if not user.is_verified:
+            user.is_verified = True  # a designated admin never needs OTP
+        db.commit()
+        db.refresh(user)
+    return user
+
+
 def signin(db: Session, email: str, password: str) -> User:
     user = db.query(User).filter(User.email == email).first()
     if user is None or not verify_password(password, user.password_hash):
@@ -182,7 +199,7 @@ def signin(db: Session, email: str, password: str) -> User:
         raise ValueError("This account has been suspended. Contact support.")
     if not user.is_verified:
         raise ValueError("Please verify your email before signing in.")
-    return user
+    return ensure_admin_status(db, user)
 
 
 def request_password_reset(db: Session, email: str) -> Optional[str]:
