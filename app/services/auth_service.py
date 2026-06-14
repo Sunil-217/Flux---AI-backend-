@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import OTP_TTL_MINUTES, ADMIN_EMAILS
 from app.core.security import hash_password, verify_password
-from app.models import User, OtpCode
+from app.models import User, OtpCode, Invite
 
 # After this many wrong guesses the code is invalidated and a new one must be
 # requested — so a 6-digit code can't be brute-forced within its TTL window.
@@ -104,6 +104,48 @@ def signup(db: Session, name: str, email: str, password: str, phone: str):
         return user, True, None  # skip OTP entirely for the admin
     code = issue_otp(db, email)
     return user, False, code
+
+
+def accept_invite(db: Session, token: str, name: str, password: str, phone: str) -> User:
+    """Consume a valid invite: create (or finalise) a PRE-VERIFIED account with
+    the chosen password. No OTP — the admin already vouched for this email.
+    Raises ValueError on an invalid / used / expired token."""
+    inv = db.query(Invite).filter(Invite.token == token).first()
+    if inv is None:
+        raise ValueError("This invite link is invalid.")
+    if inv.accepted:
+        raise ValueError("This invite has already been used. Please sign in.")
+    if inv.expires_at < datetime.utcnow():
+        raise ValueError("This invite has expired. Ask your admin for a new one.")
+
+    email = inv.email.lower()
+    existing = db.query(User).filter(User.email == email).first()
+    if existing and existing.is_verified:
+        raise ValueError("This email is already registered. Please sign in.")
+
+    is_admin_email = email in ADMIN_EMAILS
+    if existing:
+        existing.name = name
+        existing.phone = phone
+        existing.password_hash = hash_password(password)
+        existing.is_verified = True
+        if is_admin_email:
+            existing.is_admin = True
+        user = existing
+    else:
+        user = User(
+            name=name,
+            email=email,
+            phone=phone,
+            password_hash=hash_password(password),
+            is_verified=True,           # invited users are pre-verified
+            is_admin=is_admin_email,
+        )
+        db.add(user)
+    inv.accepted = True
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 def verify_otp(db: Session, email: str, code: str) -> User:

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.security import get_current_user
 from app.db import get_db
 from app.models import ApiKey, User
+from app.services.webhook_service import dispatch_event
 
 router = APIRouter()
 
@@ -85,6 +86,11 @@ def create_key(
     db.add(rec)
     db.commit()
     db.refresh(rec)
+    # Notify any subscribed platform webhooks (fire-and-forget, never blocks).
+    dispatch_event(
+        "apikey.created",
+        {"user_id": user.id, "email": user.email, "key_name": rec.name, "prefix": rec.prefix},
+    )
     # `key` is shown ONCE — the client must copy it now.
     return {"key": raw, "info": _info(rec).model_dump()}
 

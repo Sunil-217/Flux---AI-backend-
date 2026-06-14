@@ -40,6 +40,14 @@ _CORS_DEFAULT = "http://localhost:3000,http://127.0.0.1:3000"
 _CORS_RAW = os.getenv("CORS_ORIGINS", _CORS_DEFAULT)
 CORS_ORIGINS = [o.strip() for o in _CORS_RAW.split(",") if o.strip()]
 
+# ── Public base URL of the frontend (used to build invite links) ──
+# Defaults to the first configured CORS origin, then localhost. Set FRONTEND_URL
+# in production to your real site (e.g. https://close-ai.vercel.app).
+FRONTEND_URL = (
+    os.getenv("FRONTEND_URL")
+    or (CORS_ORIGINS[0] if CORS_ORIGINS else "http://localhost:3000")
+).rstrip("/")
+
 # ── Email (SMTP) for OTP delivery. If unset, OTPs are logged to the server
 #    console as a dev fallback so the flow still works without SMTP setup. ──
 SMTP_HOST = os.getenv("SMTP_HOST")

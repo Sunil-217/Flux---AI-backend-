@@ -11,17 +11,19 @@ so an admin can never accidentally lock the whole platform out of its own panel.
 
 import json
 import os
+import secrets
 import shutil
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import (
     ADMIN_EMAILS,
+    FRONTEND_URL,
     IS_PRODUCTION,
     NVIDIA_API_KEY,
     GROQ_API_KEY,
@@ -35,13 +37,18 @@ from app.db import engine, get_db
 from app.models import (
     ApiKey,
     AuditLog,
+    Broadcast,
+    Invite,
     OtpCode,
     SharedChat,
     User,
     UserChats,
     UserMemory,
+    Webhook,
 )
+from app.services.email_service import send_invite_email
 from app.services.feature_service import get_effective_features, set_features
+from app.services.webhook_service import WEBHOOK_EVENTS, deliver_test, dispatch_event
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -412,6 +419,7 @@ def delete_user(
     db.delete(u)
     db.commit()
 
+    dispatch_event("user.deleted", {"id": user_id, "email": target_email})
     return {"ok": True, "deleted": target_email}
 
 
@@ -502,6 +510,297 @@ def patch_features(
     _record(db, admin, "features.update", detail=json.dumps(req.features))
     db.commit()
     return {"features": effective}
+
+
+# ── Broadcasts (platform announcement banner) ─────────────────────────────────
+_BROADCAST_LEVELS = {"info", "warning", "success"}
+
+
+def _broadcast_row(b: Broadcast) -> dict:
+    return {
+        "id": b.id,
+        "message": b.message,
+        "level": b.level,
+        "active": bool(b.active),
+        "created_by": b.created_by,
+        "created_at": b.created_at.isoformat() if b.created_at else None,
+    }
+
+
+class BroadcastCreate(BaseModel):
+    message: str
+    level: str = "info"
+
+
+class BroadcastPatch(BaseModel):
+    active: bool
+
+
+@router.get("/broadcasts")
+def list_broadcasts(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    rows = db.query(Broadcast).order_by(Broadcast.created_at.desc()).limit(50).all()
+    return {"broadcasts": [_broadcast_row(b) for b in rows]}
+
+
+@router.post("/broadcasts")
+def create_broadcast(
+    req: BroadcastCreate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(400, "Message can't be empty.")
+    if len(message) > 500:
+        raise HTTPException(400, "Message is too long (max 500 characters).")
+    level = req.level if req.level in _BROADCAST_LEVELS else "info"
+    # One active banner at a time — deactivate any currently-active ones first.
+    db.query(Broadcast).filter(Broadcast.active == True).update({Broadcast.active: False})  # noqa: E712
+    b = Broadcast(message=message, level=level, active=True, created_by=admin.email)
+    db.add(b)
+    _record(db, admin, "broadcast.create", detail=f"[{level}] {message[:120]}")
+    db.commit()
+    db.refresh(b)
+    dispatch_event("broadcast.published", {"id": b.id, "message": message, "level": level})
+    return _broadcast_row(b)
+
+
+@router.patch("/broadcasts/{broadcast_id}")
+def update_broadcast(
+    broadcast_id: int,
+    req: BroadcastPatch,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    b = db.get(Broadcast, broadcast_id)
+    if b is None:
+        raise HTTPException(404, "Broadcast not found.")
+    if req.active and not b.active:
+        # Activating this one — deactivate the rest so only one shows.
+        db.query(Broadcast).filter(Broadcast.active == True, Broadcast.id != b.id).update(  # noqa: E712
+            {Broadcast.active: False}
+        )
+    b.active = req.active
+    _record(
+        db, admin,
+        "broadcast.activate" if req.active else "broadcast.deactivate",
+        detail=b.message[:120],
+    )
+    db.commit()
+    db.refresh(b)
+    return _broadcast_row(b)
+
+
+@router.delete("/broadcasts/{broadcast_id}")
+def delete_broadcast(
+    broadcast_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    b = db.get(Broadcast, broadcast_id)
+    if b is None:
+        raise HTTPException(404, "Broadcast not found.")
+    detail = b.message[:120]
+    db.delete(b)
+    _record(db, admin, "broadcast.delete", detail=detail)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Invites (admin-issued onboarding links) ───────────────────────────────────
+INVITE_TTL_DAYS = 7
+
+
+def _invite_row(inv: Invite) -> dict:
+    return {
+        "id": inv.id,
+        "email": inv.email,
+        "invited_by": inv.invited_by,
+        "accepted": bool(inv.accepted),
+        "expired": bool(inv.expires_at and inv.expires_at < datetime.utcnow()),
+        "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
+        "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        "link": f"{FRONTEND_URL}/?invite={inv.token}",
+    }
+
+
+class InviteCreate(BaseModel):
+    email: EmailStr
+
+
+@router.get("/invites")
+def list_invites(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    rows = db.query(Invite).order_by(Invite.created_at.desc()).limit(100).all()
+    return {"invites": [_invite_row(i) for i in rows]}
+
+
+@router.post("/invites")
+def create_invite(
+    req: InviteCreate,
+    background: BackgroundTasks,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    email = req.email.lower().strip()
+    existing_user = db.query(User).filter(User.email == email).first()
+    if existing_user and existing_user.is_verified:
+        raise HTTPException(400, "That email already has a registered account.")
+    # Replace any prior un-accepted invite for this email (one live link per email).
+    db.query(Invite).filter(Invite.email == email, Invite.accepted == False).delete()  # noqa: E712
+    token = secrets.token_urlsafe(32)
+    inv = Invite(
+        email=email,
+        token=token,
+        invited_by=admin.email,
+        expires_at=datetime.utcnow() + timedelta(days=INVITE_TTL_DAYS),
+    )
+    db.add(inv)
+    _record(db, admin, "invite.create", detail=email)
+    db.commit()
+    db.refresh(inv)
+    # Email the link in the background (best-effort); the admin also gets it in
+    # the response to copy directly, so a blocked SMTP never fails the request.
+    background.add_task(send_invite_email, email, f"{FRONTEND_URL}/?invite={token}", admin.email)
+    return _invite_row(inv)
+
+
+@router.delete("/invites/{invite_id}")
+def delete_invite(
+    invite_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    inv = db.get(Invite, invite_id)
+    if inv is None:
+        raise HTTPException(404, "Invite not found.")
+    email = inv.email
+    db.delete(inv)
+    _record(db, admin, "invite.revoke", detail=email)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Webhooks (outbound platform event notifications) ──────────────────────────
+def _webhook_events(h: Webhook) -> List[str]:
+    try:
+        evs = json.loads(h.events or "[]")
+        return evs if isinstance(evs, list) else []
+    except Exception:
+        return []
+
+
+def _webhook_row(h: Webhook) -> dict:
+    return {
+        "id": h.id,
+        "url": h.url,
+        "events": _webhook_events(h),
+        "enabled": bool(h.enabled),
+        "created_by": h.created_by,
+        "last_status": h.last_status,
+        "last_triggered_at": h.last_triggered_at.isoformat() if h.last_triggered_at else None,
+        "created_at": h.created_at.isoformat() if h.created_at else None,
+    }
+
+
+def _clean_events(events: List[str]) -> List[str]:
+    # Keep only known events, de-duplicated, preserving the catalogue order.
+    chosen = set(events)
+    return [e for e in WEBHOOK_EVENTS if e in chosen]
+
+
+class WebhookCreate(BaseModel):
+    url: str
+    events: List[str]
+
+
+class WebhookPatch(BaseModel):
+    enabled: Optional[bool] = None
+    events: Optional[List[str]] = None
+
+
+@router.get("/webhooks")
+def list_webhooks(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    rows = db.query(Webhook).order_by(Webhook.created_at.desc()).all()
+    return {"webhooks": [_webhook_row(h) for h in rows], "events": WEBHOOK_EVENTS}
+
+
+@router.post("/webhooks")
+def create_webhook(
+    req: WebhookCreate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    url = (req.url or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(400, "Webhook URL must start with http:// or https://")
+    events = _clean_events(req.events)
+    if not events:
+        raise HTTPException(400, "Select at least one event to subscribe to.")
+    secret = "whsec_" + secrets.token_urlsafe(24)
+    h = Webhook(url=url, secret=secret, events=json.dumps(events), enabled=True, created_by=admin.email)
+    db.add(h)
+    _record(db, admin, "webhook.create", detail=url)
+    db.commit()
+    db.refresh(h)
+    row = _webhook_row(h)
+    # The signing secret is shown ONCE on creation (like an API key).
+    row["secret"] = secret
+    return row
+
+
+@router.patch("/webhooks/{webhook_id}")
+def update_webhook(
+    webhook_id: int,
+    req: WebhookPatch,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    h = db.get(Webhook, webhook_id)
+    if h is None:
+        raise HTTPException(404, "Webhook not found.")
+    if req.enabled is not None and bool(h.enabled) != req.enabled:
+        h.enabled = req.enabled
+        _record(db, admin, "webhook.enable" if req.enabled else "webhook.disable", detail=h.url)
+    if req.events is not None:
+        events = _clean_events(req.events)
+        if not events:
+            raise HTTPException(400, "A webhook must subscribe to at least one event.")
+        h.events = json.dumps(events)
+        _record(db, admin, "webhook.update", detail=h.url)
+    db.commit()
+    db.refresh(h)
+    return _webhook_row(h)
+
+
+@router.delete("/webhooks/{webhook_id}")
+def delete_webhook(
+    webhook_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    h = db.get(Webhook, webhook_id)
+    if h is None:
+        raise HTTPException(404, "Webhook not found.")
+    url = h.url
+    db.delete(h)
+    _record(db, admin, "webhook.delete", detail=url)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/webhooks/{webhook_id}/test")
+def test_webhook(
+    webhook_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Send a sample event to this webhook now and report the delivery status."""
+    h = db.get(Webhook, webhook_id)
+    if h is None:
+        raise HTTPException(404, "Webhook not found.")
+    deliver_test(h.id)        # synchronous single delivery (commits in its own session)
+    db.refresh(h)
+    return {"ok": True, "last_status": h.last_status}
 
 
 # ── Audit log ────────────────────────────────────────────────────────────────

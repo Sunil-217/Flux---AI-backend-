@@ -132,3 +132,54 @@ class AuditLog(Base):
     target_email = Column(String, nullable=True)             # affected user email (if any)
     detail = Column(Text, nullable=True)                     # free-text / JSON context
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Broadcast(Base):
+    """A platform-wide announcement banner set by an admin and shown to every
+    user. At most one is active at a time (posting a new one deactivates the
+    rest); dismissal is per-user and kept client-side, so a brand-new broadcast
+    re-appears even after a previous one was dismissed."""
+
+    __tablename__ = "broadcasts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message = Column(Text, nullable=False)
+    level = Column(String, nullable=False, default="info")  # info | warning | success
+    active = Column(Boolean, default=True, nullable=False)
+    created_by = Column(String, nullable=True)              # admin email (display only)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Invite(Base):
+    """A one-time onboarding link an admin sends to a specific email. The
+    recipient opens it and sets a password — no OTP needed (the admin vouched
+    for them). `token` is the secret carried in the link."""
+
+    __tablename__ = "invites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, index=True, nullable=False)
+    token = Column(String, unique=True, index=True, nullable=False)
+    invited_by = Column(String, nullable=True)              # admin email (display only)
+    accepted = Column(Boolean, default=False, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Webhook(Base):
+    """An admin-registered outbound webhook. When a subscribed platform event
+    fires, the server POSTs signed JSON to `url`. `events` is a JSON array of
+    event names; `secret` signs each payload (HMAC-SHA256) so receivers can
+    verify the call really came from us."""
+
+    __tablename__ = "webhooks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    url = Column(String, nullable=False)
+    secret = Column(String, nullable=False)
+    events = Column(Text, nullable=False, default="[]")     # JSON array of event names
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_by = Column(String, nullable=True)              # admin email (display only)
+    last_status = Column(String, nullable=True)             # last delivery result, e.g. "200"
+    last_triggered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

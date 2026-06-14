@@ -8,6 +8,7 @@ from app.core.rate_limit import limiter
 from app.models import User
 from app.services import auth_service
 from app.services.email_service import send_otp_email
+from app.services.webhook_service import dispatch_event
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -80,6 +81,16 @@ def signup(
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    # Notify any subscribed platform webhooks (fire-and-forget, never blocks).
+    dispatch_event(
+        "user.signup",
+        {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "is_admin": bool(getattr(user, "is_admin", False)),
+        },
+    )
     if auto_verified:
         # Designated admin — verified on creation, log in immediately (no OTP).
         return {"auto_login": True, **_token_response(user)}

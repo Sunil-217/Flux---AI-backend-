@@ -100,3 +100,48 @@ def send_otp_email(to_email: str, code: str) -> None:
             "Please try again in a moment."
         )
     print(f"[OTP] all SMTP ports failed ({last_exc}) — code for {to_email}: {code}", flush=True)
+
+
+def send_invite_email(to_email: str, link: str, invited_by: str | None = None) -> None:
+    """Email an invite link. Best-effort and NEVER raises: the admin always gets
+    the link in the API response, so a blocked/missing SMTP must not fail the
+    invite-creation request (it would also strip CORS headers on a 500)."""
+    subject = "You're invited to Close AI"
+    inviter = f" by {invited_by}" if invited_by else ""
+    body = (
+        f"You've been invited{inviter} to join Close AI.\n\n"
+        f"Set your password and get started here:\n{link}\n\n"
+        f"This invite link expires in 7 days. If you weren't expecting this, you can ignore this email."
+    )
+
+    if not _smtp_configured():
+        if not IS_PRODUCTION:
+            print(f"[INVITE] SMTP not configured — link for {to_email}: {link}", flush=True)
+        else:
+            log.warning("Invite email not sent for %s — SMTP is not configured.", to_email)
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM or SMTP_USER
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    ports: list = []
+    for p in (SMTP_PORT, 2525, 587, 465):
+        try:
+            p = int(p)
+        except (TypeError, ValueError):
+            continue
+        if p not in ports:
+            ports.append(p)
+
+    last_exc = None
+    for port in ports:
+        try:
+            _send_via(SMTP_HOST, port, SMTP_USER, SMTP_PASS, msg)
+            return  # sent
+        except Exception as exc:  # noqa: BLE001 — try the next port
+            last_exc = exc
+            continue
+    log.error("Invite email failed for %s via all ports: %s", to_email, last_exc)

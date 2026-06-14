@@ -28,6 +28,8 @@ from app.api.routes import media_sources
 from app.api.routes import tts
 from app.api.routes import admin
 from app.api.routes import features
+from app.api.routes import broadcast
+from app.api.routes import invite
 
 # Create database tables if they don't exist yet.
 Base.metadata.create_all(bind=engine)
@@ -137,6 +139,8 @@ app.include_router(media_sources.router)  # /upload-youtube, /upload-github
 app.include_router(tts.router)         # /tts — neural text-to-speech (edge-tts)
 app.include_router(admin.router)       # /admin/* — platform admin control panel
 app.include_router(features.router)    # /features — public read of platform feature flags
+app.include_router(broadcast.router)   # /broadcast — public read of the active announcement
+app.include_router(invite.router)      # /invite/* — invite-link check + accept (onboarding)
 
 # Telegram bridge (optional): starts a polling thread when TELEGRAM_BOT_TOKEN is set.
 from app.services.telegram_bot import start_telegram_bridge  # noqa: E402
