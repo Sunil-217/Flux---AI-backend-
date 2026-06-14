@@ -22,6 +22,14 @@ os.environ.setdefault("GROQ_API_KEY", "")
 # ── Use an in-memory DB during tests (never touch the real flux_ai.db file) ──
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
+# ── Disable the slowapi rate limiter during tests ──
+# The limiter's in-memory counters are shared across the whole session (same
+# "testclient" IP), so a fast-firing suite would trip the per-minute caps and
+# get spurious 429s. No test asserts rate-limit behaviour, so turn it off.
+from app.core.rate_limit import limiter as _limiter  # noqa: E402
+
+_limiter.enabled = False
+
 # ── Fake the embedding service (avoid loading torch / sentence-transformers) ──
 _embed = types.ModuleType("app.services.embedding_service")
 

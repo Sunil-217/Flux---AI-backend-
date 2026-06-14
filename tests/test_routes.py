@@ -2,17 +2,46 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 
 @pytest.fixture
 def client():
-    """Authenticated TestClient — bypasses get_current_user with a dummy user."""
+    """Authenticated TestClient — bypasses get_current_user with a dummy user,
+    on an isolated in-memory DB shared across threads (StaticPool)."""
     import main
     from app.core.security import get_current_user
+    from app.db import Base, get_db
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+
+    # The chat/upload/delete routes enforce ownership (user_owns_chat); seed a
+    # row for the dummy user (id=1) so the chat ids these tests use are "owned".
+    import json as _json
+    from app.models import UserChats
+
+    _seed = TestingSession()
+    _seed.add(UserChats(user_id=1, data=_json.dumps([{"id": "c1"}, {"id": "session-xyz"}])))
+    _seed.commit()
+    _seed.close()
+
+    def override_get_db():
+        db = TestingSession()
+        try:
+            yield db
+        finally:
+            db.close()
 
     main.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id=1, name="Test", email="test@example.com"
     )
+    main.app.dependency_overrides[get_db] = override_get_db
     c = TestClient(main.app)
     yield c
     main.app.dependency_overrides.clear()
@@ -76,14 +105,16 @@ def test_delete_success(client, monkeypatch):
 
 
 # ── /upload ──
-def test_upload_rejects_non_pdf(client):
+def test_upload_rejects_unsupported_type(client):
+    # The route now accepts many document/text types; only genuinely
+    # unsupported extensions are rejected — with a 400 + detail.
     resp = client.post(
         "/upload",
-        files={"file": ("notes.txt", b"hello", "text/plain")},
+        files={"file": ("malware.exe", b"MZ\x90\x00", "application/octet-stream")},
         data={"chat_id": "c1"},
     )
-    assert resp.status_code == 200
-    assert resp.json().get("error") == "Only PDF files are allowed"
+    assert resp.status_code == 400
+    assert "Unsupported file type" in resp.json()["detail"]
 
 
 def test_upload_accepts_pdf(client, monkeypatch, tmp_path):

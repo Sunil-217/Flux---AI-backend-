@@ -10,7 +10,7 @@ def client(monkeypatch):
     """TestClient backed by an isolated in-memory DB, with OTP delivery captured."""
     import main
     from app.db import Base, get_db
-    from app.services import auth_service
+    from app.api.routes import auth as auth_route
 
     engine = create_engine(
         "sqlite://",
@@ -30,7 +30,9 @@ def client(monkeypatch):
     main.app.dependency_overrides[get_db] = override_get_db
 
     box = {}
-    monkeypatch.setattr(auth_service, "send_otp_email", lambda email, code: box.update(code=code))
+    # OTP delivery was refactored into a background task; auth.py imports
+    # send_otp_email by name, so patch it in the route module's namespace.
+    monkeypatch.setattr(auth_route, "send_otp_email", lambda email, code: box.update(code=code))
 
     c = TestClient(main.app)
     c.otp_box = box  # type: ignore[attr-defined]

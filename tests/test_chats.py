@@ -10,7 +10,7 @@ def auth_client(monkeypatch):
     """TestClient on an isolated in-memory DB, returning (client, auth_headers)."""
     import main
     from app.db import Base, get_db
-    from app.services import auth_service
+    from app.api.routes import auth as auth_route
 
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -28,7 +28,7 @@ def auth_client(monkeypatch):
     main.app.dependency_overrides[get_db] = override_get_db
 
     box = {}
-    monkeypatch.setattr(auth_service, "send_otp_email", lambda email, code: box.update(code=code))
+    monkeypatch.setattr(auth_route, "send_otp_email", lambda email, code: box.update(code=code))
 
     c = TestClient(main.app)
     c.post("/auth/signup", json={
@@ -77,9 +77,9 @@ def test_chats_are_per_user(auth_client, monkeypatch):
     c.put("/chats", json={"data": [{"id": "x"}]}, headers=headers)
 
     # Create a second user and confirm they start empty (isolation)
-    from app.services import auth_service
+    from app.api.routes import auth as auth_route
     box2 = {}
-    monkeypatch.setattr(auth_service, "send_otp_email", lambda email, code: box2.update(code=code))
+    monkeypatch.setattr(auth_route, "send_otp_email", lambda email, code: box2.update(code=code))
     c.post("/auth/signup", json={
         "name": "Asha", "email": "asha@example.com",
         "password": "secret123", "phone": "8888888888",
