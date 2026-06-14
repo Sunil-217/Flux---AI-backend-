@@ -20,9 +20,18 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.config import ADMIN_EMAILS
+from app.core.config import (
+    ADMIN_EMAILS,
+    IS_PRODUCTION,
+    NVIDIA_API_KEY,
+    GROQ_API_KEY,
+    TAVILY_API_KEY,
+    SMTP_HOST,
+    SMTP_USER,
+    SMTP_PASS,
+)
 from app.core.security import require_admin
-from app.db import get_db
+from app.db import engine, get_db
 from app.models import (
     ApiKey,
     AuditLog,
@@ -125,10 +134,63 @@ def stats(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     shared = db.query(func.count(SharedChat.id)).scalar() or 0
     memory_users = db.query(func.count(UserMemory.user_id)).scalar() or 0
 
-    # Total chats across the platform = sum of each user's sessions blob length.
+    # Total chats + per-user counts (one pass over the sessions blobs).
     total_chats = 0
-    for (blob,) in db.query(UserChats.data).all():
-        total_chats += _count_chats(blob)
+    chat_by_user: dict = {}
+    for uid, blob in db.query(UserChats.user_id, UserChats.data).all():
+        cnt = _count_chats(blob)
+        total_chats += cnt
+        if cnt:
+            chat_by_user[uid] = cnt
+
+    # Top 5 users by chat volume (most active).
+    top_ids = sorted(chat_by_user, key=lambda k: chat_by_user[k], reverse=True)[:5]
+    top_rows = (
+        {u.id: u for u in db.query(User).filter(User.id.in_(top_ids)).all()}
+        if top_ids
+        else {}
+    )
+    top_users = [
+        {
+            "id": uid,
+            "name": top_rows[uid].name,
+            "email": top_rows[uid].email,
+            "chat_count": chat_by_user[uid],
+        }
+        for uid in top_ids
+        if uid in top_rows
+    ]
+
+    # Signups per day for the last 14 days (drives the dashboard chart).
+    start14 = datetime(now.year, now.month, now.day) - timedelta(days=13)
+    by_day: dict = {}
+    for (ca,) in db.query(User.created_at).filter(User.created_at >= start14).all():
+        if ca:
+            key = ca.date().isoformat()
+            by_day[key] = by_day.get(key, 0) + 1
+    signups_by_day = [
+        {"date": (start14 + timedelta(days=i)).date().isoformat(), "count": by_day.get((start14 + timedelta(days=i)).date().isoformat(), 0)}
+        for i in range(14)
+    ]
+
+    # System health — DB engine, environment, and which AI providers are wired up
+    # (booleans only — never expose key values).
+    drivername = engine.url.drivername
+    database = (
+        "PostgreSQL" if drivername.startswith("postgres")
+        else "SQLite" if drivername.startswith("sqlite")
+        else drivername
+    )
+    system = {
+        "database": database,
+        "environment": "production" if IS_PRODUCTION else "development",
+        "providers": {
+            "nvidia": bool(NVIDIA_API_KEY),
+            "groq": bool(GROQ_API_KEY),
+            "tavily": bool(TAVILY_API_KEY),
+            "email": bool(SMTP_HOST and SMTP_USER and SMTP_PASS),
+        },
+    }
 
     recent = (
         db.query(User).order_by(User.created_at.desc()).limit(6).all()
@@ -152,6 +214,9 @@ def stats(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
             "shared_chats": shared,
             "memory_users": memory_users,
         },
+        "signups_by_day": signups_by_day,
+        "top_users": top_users,
+        "system": system,
         "recent_signups": [
             {
                 "id": u.id,
