@@ -46,7 +46,7 @@ from app.models import (
     UserMemory,
     Webhook,
 )
-from app.services.email_service import send_invite_email
+from app.services.email_service import send_announcement_email, send_invite_email
 from app.services.feature_service import get_effective_features, set_features
 from app.services.webhook_service import WEBHOOK_EVENTS, deliver_test, dispatch_event
 
@@ -306,6 +306,91 @@ def get_user(
     return _user_row(u, _count_chats(rec.data if rec else None), key_count)
 
 
+# ── Per-user activity log (timeline derived from existing data) ───────────────
+@router.get("/users/{user_id}/activity")
+def user_activity(
+    user_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """A per-user timeline built from data we already keep: account creation,
+    every admin action taken ON this user (audit log), and API-key create/use.
+    Plus a footprint summary (chats, keys, memory, shared chats). No new
+    tracking — works for every existing user immediately."""
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "User not found.")
+
+    events: List[dict] = []
+
+    if u.created_at:
+        events.append({
+            "type": "account.created",
+            "label": "Account created",
+            "detail": None,
+            "actor": None,
+            "at": u.created_at.isoformat(),
+        })
+
+    # Admin actions taken on this user (this is the user's half of the audit log).
+    for a in (
+        db.query(AuditLog)
+        .filter(AuditLog.target_id == u.id)
+        .order_by(AuditLog.created_at.desc())
+        .limit(100)
+        .all()
+    ):
+        events.append({
+            "type": a.action,
+            "label": None,  # the frontend maps the action → a friendly label
+            "detail": a.detail,
+            "actor": a.actor_email,
+            "at": a.created_at.isoformat() if a.created_at else None,
+        })
+
+    # Developer-API-key lifecycle.
+    for k in db.query(ApiKey).filter(ApiKey.user_id == u.id).all():
+        if k.created_at:
+            events.append({
+                "type": "apikey.created",
+                "label": "Created an API key",
+                "detail": f"{k.name} · {k.prefix}",
+                "actor": None,
+                "at": k.created_at.isoformat(),
+            })
+        if k.last_used_at:
+            events.append({
+                "type": "apikey.used",
+                "label": "Last used an API key",
+                "detail": f"{k.name} · {k.usage_count} reqs",
+                "actor": None,
+                "at": k.last_used_at.isoformat(),
+            })
+
+    events.sort(key=lambda e: e["at"] or "", reverse=True)
+
+    rec = db.get(UserChats, u.id)
+    mem = db.get(UserMemory, u.id)
+    mem_count = 0
+    if mem:
+        try:
+            mem_count = len(json.loads(mem.facts) or [])
+        except Exception:
+            mem_count = 0
+    key_total = db.query(func.count(ApiKey.id)).filter(ApiKey.user_id == u.id).scalar() or 0
+    shared = db.query(func.count(SharedChat.id)).filter(SharedChat.owner_id == u.id).scalar() or 0
+
+    return {
+        "footprint": {
+            "chats": _count_chats(rec.data if rec else None),
+            "api_keys": int(key_total),
+            "memory_facts": mem_count,
+            "shared_chats": int(shared),
+        },
+        "events": events,
+    }
+
+
 # ── User mutations ───────────────────────────────────────────────────────────
 class UpdateUserRequest(BaseModel):
     is_verified: Optional[bool] = None
@@ -530,10 +615,25 @@ def _broadcast_row(b: Broadcast) -> dict:
 class BroadcastCreate(BaseModel):
     message: str
     level: str = "info"
+    # When email_users is true, the announcement is ALSO emailed to every
+    # verified, non-banned user (in the background). `subject` is the email
+    # subject line (falls back to a default).
+    subject: Optional[str] = None
+    email_users: bool = False
 
 
 class BroadcastPatch(BaseModel):
     active: bool
+
+
+def _blast_announcement(subject: str, message: str, recipients: List[str]) -> None:
+    """Background task: email each recipient the announcement, one at a time.
+    Isolated + best-effort — one failure never stops the rest of the blast."""
+    for addr in recipients:
+        try:
+            send_announcement_email(addr, subject, message)
+        except Exception:
+            continue
 
 
 @router.get("/broadcasts")
@@ -542,9 +642,23 @@ def list_broadcasts(admin: User = Depends(require_admin), db: Session = Depends(
     return {"broadcasts": [_broadcast_row(b) for b in rows]}
 
 
+@router.get("/announcement-audience")
+def announcement_audience(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """How many users an email announcement would reach (verified, not banned).
+    Drives the recipient-count shown in the composer before a mass send."""
+    count = (
+        db.query(func.count(User.id))
+        .filter(User.is_verified == True, User.is_banned == False)  # noqa: E712
+        .scalar()
+        or 0
+    )
+    return {"recipients": int(count)}
+
+
 @router.post("/broadcasts")
 def create_broadcast(
     req: BroadcastCreate,
+    background: BackgroundTasks,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -559,10 +673,30 @@ def create_broadcast(
     b = Broadcast(message=message, level=level, active=True, created_by=admin.email)
     db.add(b)
     _record(db, admin, "broadcast.create", detail=f"[{level}] {message[:120]}")
+
+    # ── Optional email blast to every verified, non-banned user ──
+    emailed = 0
+    if req.email_users:
+        subject = (req.subject or "").strip() or "Announcement from Close AI"
+        recipients = [
+            e
+            for (e,) in db.query(User.email)
+            .filter(User.is_verified == True, User.is_banned == False)  # noqa: E712
+            .all()
+            if e
+        ]
+        emailed = len(recipients)
+        if recipients:
+            # Background so SMTP latency for N users never blocks the request.
+            background.add_task(_blast_announcement, subject, message, recipients)
+            _record(db, admin, "broadcast.email_blast", detail=f"{emailed} recipients · {subject[:80]}")
+
     db.commit()
     db.refresh(b)
     dispatch_event("broadcast.published", {"id": b.id, "message": message, "level": level})
-    return _broadcast_row(b)
+    row = _broadcast_row(b)
+    row["emailed"] = emailed
+    return row
 
 
 @router.patch("/broadcasts/{broadcast_id}")
