@@ -46,7 +46,7 @@ from app.models import (
     UserMemory,
     Webhook,
 )
-from app.services.email_service import send_announcement_email, send_invite_email
+from app.services.email_service import send_announcement_bulk, send_invite_email
 from app.services.feature_service import get_effective_features, set_features
 from app.services.webhook_service import WEBHOOK_EVENTS, deliver_test, dispatch_event
 
@@ -627,13 +627,12 @@ class BroadcastPatch(BaseModel):
 
 
 def _blast_announcement(subject: str, message: str, recipients: List[str]) -> None:
-    """Background task: email each recipient the announcement, one at a time.
-    Isolated + best-effort — one failure never stops the rest of the blast."""
-    for addr in recipients:
-        try:
-            send_announcement_email(addr, subject, message)
-        except Exception:
-            continue
+    """Background task: email the whole list over ONE reused SMTP connection so a
+    blast goes out in ~1-2s instead of re-connecting per recipient. Best-effort."""
+    try:
+        send_announcement_bulk(recipients, subject, message)
+    except Exception:
+        pass
 
 
 @router.get("/broadcasts")

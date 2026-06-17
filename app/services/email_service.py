@@ -70,6 +70,7 @@ def send_otp_email(to_email: str, code: str) -> None:
     msg["From"] = SMTP_FROM or SMTP_USER
     msg["To"] = to_email
     msg.set_content(body)
+    msg.add_alternative(_otp_html(code), subtype="html")
 
     # Try the configured port first, then cloud-friendly fallbacks. 2525 is
     # Brevo's alternative port (usually open when 587 is blocked); 465 is SSL.
@@ -127,6 +128,7 @@ def send_invite_email(to_email: str, link: str, invited_by: str | None = None) -
     msg["From"] = SMTP_FROM or SMTP_USER
     msg["To"] = to_email
     msg.set_content(body)
+    msg.add_alternative(_invite_html(link, invited_by), subtype="html")
 
     ports: list = []
     for p in (SMTP_PORT, 2525, 587, 465):
@@ -180,51 +182,161 @@ def _announcement_text(subject: str, message: str) -> str:
     )
 
 
-def _announcement_html(subject: str, message: str) -> str:
-    """A branded, responsive HTML announcement. Table-based + inline styles only
-    (the only thing email clients render reliably). No <style> blocks."""
+def _email_shell(
+    eyebrow: str,
+    heading: str,
+    intro_html: str = "",
+    hero_html: str = "",
+    cta_label: str = "",
+    cta_url: str = "",
+    preheader: str = "",
+) -> str:
+    """The shared premium email frame — dark, on-brand, fully table-based and
+    bulletproof (Outlook VML button, hidden preheader, solid fallbacks behind
+    every gradient, no <style> blocks or external assets). EVERY transactional and
+    announcement email renders through this, so they all look identical.
+
+    `eyebrow` / `heading` / `preheader` are PLAIN text (escaped here);
+    `intro_html` / `hero_html` are trusted HTML the caller already assembled."""
     import html as _html
 
-    safe_subject = _html.escape(subject)
+    font = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+    safe_eyebrow = _html.escape(eyebrow)
+    safe_heading = _html.escape(heading)
+    safe_pre = _html.escape(preheader or heading)
+    pad = "&#847;&zwnj;&nbsp;" * 24  # invisible spacer so the inbox preview shows only the preheader
+
+    intro_block = (
+        f'<tr><td style="padding:22px 40px 0;color:#b9b9c0;font-size:15.5px;line-height:1.7;font-family:{font};">{intro_html}</td></tr>'
+        if intro_html
+        else ""
+    )
+    hero_block = f'<tr><td style="padding:22px 40px 0;">{hero_html}</td></tr>' if hero_html else ""
+    cta_block = ""
+    if cta_label and cta_url:
+        safe_label = _html.escape(cta_label)
+        cta_block = f"""<tr><td style="padding:30px 40px 6px;">
+  <!--[if mso]>
+  <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="{cta_url}" style="height:48px;v-text-anchor:middle;width:240px;" arcsize="24%" strokecolor="#ef4444" fillcolor="#ef4444">
+  <w:anchorlock/>
+  <center style="color:#ffffff;font-family:{font};font-size:15px;font-weight:bold;">{safe_label}</center>
+  </v:roundrect>
+  <![endif]-->
+  <!--[if !mso]><!-->
+  <a href="{cta_url}" style="display:inline-block;background:linear-gradient(135deg,#fb7185,#ef4444);background-color:#ef4444;color:#ffffff;text-decoration:none;font-size:15px;font-weight:700;line-height:48px;padding:0 32px;border-radius:12px;font-family:{font};">{safe_label}&nbsp;&nbsp;&rarr;</a>
+  <!--<![endif]-->
+</td></tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="color-scheme" content="dark light">
+<meta name="supported-color-schemes" content="dark light">
+<title>{safe_heading}</title>
+<!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
+</head>
+<body style="margin:0;padding:0;background-color:#07070a;-webkit-font-smoothing:antialiased;font-family:{font};">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#07070a;font-size:1px;line-height:1px;">{safe_pre}{pad}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#07070a" style="background-color:#07070a;">
+<tr><td align="center" style="padding:36px 14px;">
+
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;background-color:#111114;border:1px solid #26262b;border-radius:18px;overflow:hidden;">
+
+<tr><td height="4" style="height:4px;font-size:0;line-height:0;background:linear-gradient(90deg,#fca5a5,#f87171,#ef4444);">&nbsp;</td></tr>
+
+<tr><td bgcolor="#141015" style="background:linear-gradient(180deg,#1c1013,#121215);padding:34px 40px 26px;">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+    <td width="46" height="46" align="center" valign="middle" bgcolor="#ef4444" style="width:46px;height:46px;background:linear-gradient(135deg,#fb7185,#ef4444);border-radius:13px;color:#ffffff;font-family:{font};font-size:23px;font-weight:800;text-align:center;line-height:46px;">C</td>
+    <td valign="middle" style="padding-left:14px;">
+      <div style="color:#ffffff;font-size:19px;font-weight:700;letter-spacing:-0.02em;line-height:1.1;">Close AI</div>
+      <div style="color:#8a8a93;font-size:12px;line-height:1.4;margin-top:3px;">Document intelligence</div>
+    </td>
+  </tr></table>
+  <div style="height:22px;line-height:22px;font-size:0;">&nbsp;</div>
+  <div style="color:#fb7185;font-size:11px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;">{safe_eyebrow}</div>
+  <h1 style="margin:9px 0 0;color:#f6f6f7;font-size:25px;line-height:1.3;font-weight:800;letter-spacing:-0.02em;">{safe_heading}</h1>
+</td></tr>
+{intro_block}
+{hero_block}
+{cta_block}
+<tr><td style="padding:30px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td height="1" style="height:1px;font-size:0;line-height:0;background-color:#26262b;">&nbsp;</td></tr></table></td></tr>
+
+<tr><td style="padding:20px 40px 34px;">
+  <p style="margin:0;color:#6f6f78;font-size:12px;line-height:1.6;font-family:{font};">This is an automated message from Close AI. If you weren&rsquo;t expecting it, you can safely ignore this email.</p>
+  <p style="margin:6px 0 0;color:#6f6f78;font-size:12px;line-height:1.6;font-family:{font};">Powered by <span style="color:#fb7185;font-weight:600;">Fluxera</span></p>
+</td></tr>
+
+</table>
+
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;"><tr><td align="center" style="padding:18px 16px 0;">
+  <p style="margin:0;color:#4a4a52;font-size:11px;line-height:1.5;font-family:{font};">&copy; Close AI &middot; Powered by Fluxera</p>
+</td></tr></table>
+
+</td></tr>
+</table>
+</body>
+</html>"""
+
+
+def _announcement_html(subject: str, message: str) -> str:
+    """Admin announcement — rendered through the shared shell."""
+    import html as _html
+    import re as _re
+
     safe_body = _html.escape(message).replace("\n", "<br>")
-    return (
-        '<!DOCTYPE html>'
-        '<html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f'<title>{safe_subject}</title></head>'
-        '<body style="margin:0;padding:0;background:#f4f4f7;'
-        '-webkit-font-smoothing:antialiased;'
-        'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;">'
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-        'style="background:#f4f4f7;padding:32px 16px;"><tr><td align="center">'
-        # ── Card ──
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-        'style="max-width:560px;width:100%;background:#ffffff;border-radius:16px;'
-        'overflow:hidden;box-shadow:0 12px 40px -12px rgba(0,0,0,0.18);">'
-        # Accent bar
-        '<tr><td style="height:5px;background:linear-gradient(90deg,#fca5a5,#f87171,#ef4444);"></td></tr>'
-        # Header
-        '<tr><td style="padding:30px 36px 8px;">'
-        '<span style="font-size:20px;font-weight:700;color:#ef4444;letter-spacing:-0.02em;">Close AI</span>'
-        '<span style="font-size:12px;color:#9ca3af;margin-left:8px;">Announcement</span>'
-        '</td></tr>'
-        # Subject
-        f'<tr><td style="padding:8px 36px 0;"><h1 style="margin:0;font-size:22px;'
-        f'line-height:1.3;font-weight:700;color:#111827;letter-spacing:-0.01em;">{safe_subject}</h1></td></tr>'
-        # Body
-        f'<tr><td style="padding:16px 36px 4px;font-size:15px;line-height:1.65;color:#374151;">{safe_body}</td></tr>'
-        # CTA
-        '<tr><td style="padding:24px 36px 8px;">'
-        f'<a href="{FRONTEND_URL}" style="display:inline-block;background:#ef4444;color:#ffffff;'
-        'text-decoration:none;font-size:14px;font-weight:600;padding:12px 26px;border-radius:10px;">'
-        'Open Close AI</a></td></tr>'
-        # Footer
-        '<tr><td style="padding:24px 36px 30px;border-top:1px solid #f0f0f3;margin-top:12px;">'
-        '<p style="margin:16px 0 0;font-size:12px;line-height:1.5;color:#9ca3af;">'
-        'You\'re receiving this because you have a Close AI account.<br>'
-        'Powered by <span style="color:#ef4444;font-weight:600;">Fluxera</span>.</p>'
-        '</td></tr>'
-        '</table></td></tr></table></body></html>'
+    snippet = _re.sub(r"\s+", " ", message or "").strip()[:110]
+    return _email_shell(
+        eyebrow="Announcement",
+        heading=subject,
+        intro_html=safe_body,
+        cta_label="Open Close AI",
+        cta_url=FRONTEND_URL,
+        preheader=snippet or subject,
+    )
+
+
+def _otp_html(code: str) -> str:
+    """Verification / password-reset code email — shared shell + a big code box.
+    One template serves both signup verification and password reset."""
+    import html as _html
+
+    safe_code = _html.escape(code)
+    code_box = (
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
+        '<td style="background-color:#1a1a1f;border:1px solid #2e2e35;border-radius:14px;'
+        'padding:16px 28px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;'
+        f'font-size:34px;font-weight:700;letter-spacing:0.32em;color:#f6f6f7;text-align:center;">{safe_code}</td>'
+        "</tr></table>"
+    )
+    return _email_shell(
+        eyebrow="Verification",
+        heading="Your verification code",
+        intro_html='Enter this code to continue. It expires in <strong style="color:#d8d8de;font-weight:600;">10 minutes</strong>.',
+        hero_html=code_box,
+        preheader=f"Your Close AI code: {safe_code}",
+    )
+
+
+def _invite_html(link: str, invited_by: str | None = None) -> str:
+    """Admin invite email — shared shell + an Accept button."""
+    import html as _html
+
+    inviter = f" by {_html.escape(invited_by)}" if invited_by else ""
+    intro = (
+        f"You&rsquo;ve been invited{inviter} to join "
+        '<strong style="color:#d8d8de;font-weight:600;">Close AI</strong> — your AI workspace for '
+        "documents, research, and code. Set a password to get started. This invite link expires in 7 days."
+    )
+    return _email_shell(
+        eyebrow="Invitation",
+        heading="You're invited to Close AI",
+        intro_html=intro,
+        cta_label="Accept invitation",
+        cta_url=link,
+        preheader="You've been invited to Close AI",
     )
 
 
@@ -246,3 +358,78 @@ def send_announcement_email(to_email: str, subject: str, message: str) -> None:
             log.warning("Announcement email failed for %s (all ports).", to_email)
     except Exception as exc:  # noqa: BLE001 — never propagate from a bulk send
         log.warning("Announcement email error for %s: %s", to_email, exc)
+
+
+def _open_smtp(timeout: int = 8):
+    """Open + authenticate a SINGLE SMTP connection, trying the configured port
+    then fallbacks. Returns a live, logged-in smtplib server, or None if every
+    port failed. Short timeout so a blocked port fails fast instead of hanging."""
+    ports: list = []
+    for p in (SMTP_PORT, 2525, 587, 465):
+        try:
+            p = int(p)
+        except (TypeError, ValueError):
+            continue
+        if p not in ports:
+            ports.append(p)
+    for port in ports:
+        try:
+            if port == 465:
+                server = smtplib.SMTP_SSL(SMTP_HOST, port, timeout=timeout)
+            else:
+                server = smtplib.SMTP(SMTP_HOST, port, timeout=timeout)
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+            server.login(SMTP_USER, SMTP_PASS)
+            return server
+        except Exception:  # noqa: BLE001 — try the next port
+            continue
+    return None
+
+
+def send_announcement_bulk(recipients: list, subject: str, message: str) -> int:
+    """Send the announcement to many recipients over ONE reused SMTP connection
+    (connect + log in once, then a single send per recipient). This is what makes
+    a blast go out in ~1-2s instead of re-connecting per email — the old path paid
+    a full TCP+TLS+AUTH handshake (seconds) for every single recipient. Returns the
+    count actually sent. Best-effort — one bad address never stops the rest."""
+    if not recipients:
+        return 0
+    if not _smtp_configured():
+        if not IS_PRODUCTION:
+            print(f"[ANNOUNCE] SMTP not configured — would email {len(recipients)} users: {subject}", flush=True)
+        return 0
+
+    # The body is identical for everyone — render it ONCE; only the envelope
+    # (the "To" line) changes per recipient.
+    html = _announcement_html(subject, message)
+    text = _announcement_text(subject, message)
+    sender = SMTP_FROM or SMTP_USER
+
+    server = _open_smtp()
+    if server is None:
+        log.warning("Announcement blast: could not open an SMTP connection (all ports failed).")
+        return 0
+
+    sent = 0
+    try:
+        for to_email in recipients:
+            try:
+                msg = EmailMessage()
+                msg["Subject"] = subject
+                msg["From"] = sender
+                msg["To"] = to_email
+                msg.set_content(text)
+                msg.add_alternative(html, subtype="html")
+                server.send_message(msg)
+                sent += 1
+            except Exception as exc:  # noqa: BLE001 — skip a bad address, keep going
+                log.warning("Announcement send failed for %s: %s", to_email, exc)
+                continue
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return sent
