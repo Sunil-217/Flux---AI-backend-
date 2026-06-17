@@ -229,13 +229,30 @@ def reset_password(db: Session, email: str, code: str, new_password: str) -> Use
     return user
 
 
-def update_profile(db: Session, user: User, name: str, phone: str | None = None) -> User:
+def update_profile(
+    db: Session,
+    user: User,
+    name: str,
+    phone: str | None = None,
+    avatar: str | None = None,
+) -> User:
     name = name.strip()
     if not name:
         raise ValueError("Name cannot be empty.")
     user.name = name
     if phone is not None:
         user.phone = phone.strip()
+    if avatar is not None:
+        av = avatar.strip()
+        if av == "":
+            user.avatar = None  # cleared → fall back to the monogram
+        elif av.startswith("preset:") or av.startswith("data:image/"):
+            # base64 of a client-resized 256px photo is ~20-40KB; 500k is generous.
+            if len(av) > 500_000:
+                raise ValueError("That image is too large — please choose a smaller photo.")
+            user.avatar = av
+        else:
+            raise ValueError("Invalid avatar.")
     db.commit()
     db.refresh(user)
     return user

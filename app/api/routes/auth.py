@@ -52,6 +52,7 @@ def _user_out(user: User) -> dict:
         "email": user.email,
         "phone": user.phone,
         "is_admin": bool(getattr(user, "is_admin", False)),
+        "avatar": getattr(user, "avatar", None),
     }
 
 
@@ -183,6 +184,7 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 class UpdateProfileRequest(BaseModel):
     name: str
     phone: str | None = None
+    avatar: str | None = None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -197,7 +199,7 @@ def update_profile(
     db: Session = Depends(get_db),
 ):
     try:
-        updated = auth_service.update_profile(db, user, req.name, req.phone)
+        updated = auth_service.update_profile(db, user, req.name, req.phone, req.avatar)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return _user_out(updated)

@@ -46,6 +46,7 @@ def _ensure_schema():
         ("users", "is_admin", "BOOLEAN NOT NULL DEFAULT 0"),
         ("users", "is_banned", "BOOLEAN NOT NULL DEFAULT 0"),
         ("users", "api_blocked", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("users", "avatar", "TEXT"),
     ]
     try:
         insp = inspect(engine)

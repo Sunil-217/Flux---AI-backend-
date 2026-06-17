@@ -24,6 +24,9 @@ class User(Base):
     # lose API access).
     api_blocked = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Optional profile avatar: a small base64 data URL (uploaded photo) or a
+    # "preset:<id>" token. Null = the default monogram.
+    avatar = Column(Text, nullable=True)
 
 
 class OtpCode(Base):
