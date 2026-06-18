@@ -57,11 +57,11 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 # hold. No payment integration yet — everyone is on "free"; paid tiers are
 # display-only upgrades surfaced in the UI.
 PLANS = [
-    {"key": "free",       "label": "Free",       "price": "$0",     "doc_limit": 1,      "blurb": "1 document, embeddable chat widget"},
-    {"key": "go",         "label": "Go",         "price": "$9/mo",  "doc_limit": 5,      "blurb": "5 documents, higher rate limits"},
-    {"key": "pro",        "label": "Pro",        "price": "$29/mo", "doc_limit": 25,     "blurb": "25 documents, priority answers"},
-    {"key": "max",        "label": "Max",        "price": "$99/mo", "doc_limit": 100,    "blurb": "100 documents, analytics"},
-    {"key": "enterprise", "label": "Enterprise", "price": "Custom", "doc_limit": 100000, "blurb": "Unlimited documents, SSO, SLA"},
+    {"key": "free",       "label": "Free",       "price": "₹0",        "doc_limit": 1,      "blurb": "1 document, embeddable chat widget"},
+    {"key": "go",         "label": "Go",         "price": "₹299/mo",   "doc_limit": 3,      "blurb": "3 documents, higher rate limits"},
+    {"key": "pro",        "label": "Pro",        "price": "₹799/mo",   "doc_limit": 7,      "blurb": "7 documents, priority answers"},
+    {"key": "max",        "label": "Max",        "price": "₹1,499/mo", "doc_limit": 10,     "blurb": "10 documents, analytics"},
+    {"key": "enterprise", "label": "Enterprise", "price": "Custom",    "doc_limit": 100000, "blurb": "Unlimited documents, SSO, SLA"},
 ]
 _PLAN_BY_KEY = {p["key"]: p for p in PLANS}
 
