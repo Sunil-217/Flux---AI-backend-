@@ -78,3 +78,25 @@ def delete_collection(
         # Collection may not exist — safe to ignore
         pass
 
+
+def get_or_create_business_collection(collection_name: str):
+    """Get/create an isolated ChromaDB collection for a business tenant."""
+    return client.get_or_create_collection(name=collection_name)
+
+
+def delete_business_document_chunks(collection_name: str, upload_uid: str) -> None:
+    """Remove all chunks for one document upload from a business collection."""
+    try:
+        collection = client.get_collection(name=collection_name)
+        collection.delete(where={"upload_uid": {"$eq": upload_uid}})
+    except Exception:
+        pass
+
+
+def delete_business_collection(collection_name: str) -> None:
+    """Delete an entire business tenant's ChromaDB collection."""
+    try:
+        client.delete_collection(name=collection_name)
+    except Exception:
+        pass
+

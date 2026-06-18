@@ -186,3 +186,38 @@ class Webhook(Base):
     last_status = Column(String, nullable=True)             # last delivery result, e.g. "200"
     last_triggered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class BusinessTenant(Base):
+    """A business that embeds Close AI RAG into their own product.
+
+    Admin creates a tenant → gets a one-time raw key (bk_...) → business
+    uploads their docs via /portal and embeds the chat widget. The raw key is
+    shown once and never stored — only its SHA-256 hash (same pattern as ApiKey)."""
+
+    __tablename__ = "business_tenants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_name = Column(String, nullable=False)
+    api_key_hash = Column(String, unique=True, index=True, nullable=False)
+    api_key_prefix = Column(String, nullable=False)         # "bk_Abcd…xyz9" display
+    collection_name = Column(String, unique=True, nullable=False)  # ChromaDB namespace
+    doc_count = Column(Integer, default=0, nullable=False)
+    chat_count = Column(Integer, default=0, nullable=False)
+    revoked = Column(Boolean, default=False, nullable=False)
+    created_by = Column(Integer, nullable=True)             # admin user_id
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class BusinessDocument(Base):
+    """A document uploaded to a business tenant's RAG knowledge base."""
+
+    __tablename__ = "business_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, index=True, nullable=False)
+    filename = Column(String, nullable=False)
+    file_size = Column(Integer, default=0, nullable=False)
+    chunk_count = Column(Integer, default=0, nullable=False)
+    upload_uid = Column(String, nullable=False)             # prefix used for ChromaDB chunk IDs
+    uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)

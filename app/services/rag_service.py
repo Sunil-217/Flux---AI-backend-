@@ -1075,6 +1075,29 @@ def ask_question(
     return _rag_chat(collection, question, history, chat_id)
 
 
+def ask_business_question(collection_name: str, question: str, history: list = []) -> dict:
+    """RAG query from a business tenant's isolated document collection.
+
+    Returns {answer, sources}. If no docs uploaded yet, returns a clear message
+    instead of a general AI answer — business chat should only answer from their
+    own knowledge base.
+    """
+    from app.services.chroma_service import get_or_create_business_collection
+
+    collection = get_or_create_business_collection(collection_name)
+
+    if collection.count() == 0:
+        return {
+            "answer": (
+                "No documents have been uploaded to this knowledge base yet. "
+                "Please upload your business documents via the portal first."
+            ),
+            "sources": [],
+        }
+
+    return _rag_chat(collection, question, history)
+
+
 # ── Streaming (token-by-token) — makes answers feel instant ─────────────────
 
 def _sse(payload: dict) -> str:
