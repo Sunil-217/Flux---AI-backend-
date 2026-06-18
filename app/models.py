@@ -107,6 +107,15 @@ class ApiKey(Base):
     total_tokens = Column(Integer, default=0, nullable=False)  # completion tokens used
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_used_at = Column(DateTime, nullable=True)
+    # Subscription plan governing this app's knowledge-base doc limit. No payment
+    # yet — everyone is "free" (1 doc) and paid tiers are display-only upgrades.
+    plan = Column(String, default="free", nullable=False)
+    # Public, RAG-only token (wk_...) safe to embed in a customer-facing iframe.
+    # Unlike the secret ck_ key, it ONLY answers from this app's uploaded docs —
+    # it can't call the general LLM API, so leaking it can't burn the owner's
+    # quota. Stored in the clear (it is public by design) and recoverable so the
+    # embed code can always be re-shown. Generated lazily for pre-existing keys.
+    widget_token = Column(String, unique=True, index=True, nullable=True)
 
 
 class FeatureFlag(Base):
@@ -188,34 +197,19 @@ class Webhook(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
-class BusinessTenant(Base):
-    """A business that embeds Close AI RAG into their own product.
+class KnowledgeDocument(Base):
+    """A document uploaded into one API key's RAG knowledge base.
 
-    Admin creates a tenant → gets a one-time raw key (bk_...) → business
-    uploads their docs via /portal and embeds the chat widget. The raw key is
-    shown once and never stored — only its SHA-256 hash (same pattern as ApiKey)."""
+    Each ApiKey (ck_ key) represents one "app/project" and owns an isolated
+    ChromaDB collection (kb_<api_key_id>). The key owner uploads their app's
+    docs (PDF/Word/etc.); their end users then query them via the embedded chat
+    widget or the RAG API. `upload_uid` is the prefix used for this document's
+    ChromaDB chunk IDs, so a single document can be deleted independently."""
 
-    __tablename__ = "business_tenants"
-
-    id = Column(Integer, primary_key=True, index=True)
-    business_name = Column(String, nullable=False)
-    api_key_hash = Column(String, unique=True, index=True, nullable=False)
-    api_key_prefix = Column(String, nullable=False)         # "bk_Abcd…xyz9" display
-    collection_name = Column(String, unique=True, nullable=False)  # ChromaDB namespace
-    doc_count = Column(Integer, default=0, nullable=False)
-    chat_count = Column(Integer, default=0, nullable=False)
-    revoked = Column(Boolean, default=False, nullable=False)
-    created_by = Column(Integer, nullable=True)             # admin user_id
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
-class BusinessDocument(Base):
-    """A document uploaded to a business tenant's RAG knowledge base."""
-
-    __tablename__ = "business_documents"
+    __tablename__ = "knowledge_documents"
 
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, index=True, nullable=False)
+    api_key_id = Column(Integer, index=True, nullable=False)  # references api_keys.id
     filename = Column(String, nullable=False)
     file_size = Column(Integer, default=0, nullable=False)
     chunk_count = Column(Integer, default=0, nullable=False)

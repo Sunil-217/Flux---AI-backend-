@@ -35,6 +35,11 @@ class CreateKeyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=60)
 
 
+def gen_widget_token() -> str:
+    """Public RAG-only token embedded in the customer-facing chat widget."""
+    return "wk_" + secrets.token_urlsafe(24)
+
+
 class KeyInfo(BaseModel):
     id: int
     name: str
@@ -42,6 +47,7 @@ class KeyInfo(BaseModel):
     revoked: bool
     usage_count: int
     total_tokens: int
+    plan: str = "free"
     created_at: Optional[str] = None
     last_used_at: Optional[str] = None
 
@@ -54,6 +60,7 @@ def _info(k: ApiKey) -> KeyInfo:
         revoked=k.revoked,
         usage_count=k.usage_count or 0,
         total_tokens=k.total_tokens or 0,
+        plan=getattr(k, "plan", None) or "free",
         created_at=k.created_at.isoformat() if k.created_at else None,
         last_used_at=k.last_used_at.isoformat() if k.last_used_at else None,
     )
@@ -81,6 +88,8 @@ def create_key(
         name=req.name.strip(),
         key_hash=hash_key(raw),
         prefix=_display_prefix(raw),
+        plan="free",
+        widget_token=gen_widget_token(),
         created_at=datetime.utcnow(),
     )
     db.add(rec)

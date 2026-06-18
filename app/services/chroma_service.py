@@ -79,13 +79,13 @@ def delete_collection(
         pass
 
 
-def get_or_create_business_collection(collection_name: str):
-    """Get/create an isolated ChromaDB collection for a business tenant."""
+def get_or_create_kb_collection(collection_name: str):
+    """Get/create an isolated ChromaDB collection for one API key's knowledge base."""
     return client.get_or_create_collection(name=collection_name)
 
 
-def delete_business_document_chunks(collection_name: str, upload_uid: str) -> None:
-    """Remove all chunks for one document upload from a business collection."""
+def delete_kb_document_chunks(collection_name: str, upload_uid: str) -> None:
+    """Remove all chunks for one document upload from a knowledge-base collection."""
     try:
         collection = client.get_collection(name=collection_name)
         collection.delete(where={"upload_uid": {"$eq": upload_uid}})
@@ -93,8 +93,8 @@ def delete_business_document_chunks(collection_name: str, upload_uid: str) -> No
         pass
 
 
-def delete_business_collection(collection_name: str) -> None:
-    """Delete an entire business tenant's ChromaDB collection."""
+def delete_kb_collection(collection_name: str) -> None:
+    """Delete an entire API key's knowledge-base ChromaDB collection."""
     try:
         client.delete_collection(name=collection_name)
     except Exception:

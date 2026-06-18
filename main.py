@@ -30,7 +30,7 @@ from app.api.routes import admin
 from app.api.routes import features
 from app.api.routes import broadcast
 from app.api.routes import invite
-from app.api.routes import business
+from app.api.routes import kb
 
 # Create database tables if they don't exist yet.
 Base.metadata.create_all(bind=engine)
@@ -48,6 +48,9 @@ def _ensure_schema():
         ("users", "is_banned", "BOOLEAN NOT NULL DEFAULT 0"),
         ("users", "api_blocked", "BOOLEAN NOT NULL DEFAULT 0"),
         ("users", "avatar", "TEXT"),
+        # Per-app RAG: plan tier + public widget token on each developer key.
+        ("api_keys", "plan", "VARCHAR NOT NULL DEFAULT 'free'"),
+        ("api_keys", "widget_token", "VARCHAR"),
     ]
     try:
         insp = inspect(engine)
@@ -122,6 +125,36 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+
+# Open CORS for the embeddable RAG chat endpoint ONLY. The widget is loaded in
+# an iframe / called from arbitrary customer domains, and it authenticates with
+# a public, RAG-only widget token (not cookies), so reflecting any origin here
+# is safe and scoped. Added AFTER CORSMiddleware so it is the OUTERMOST layer —
+# it short-circuits the preflight before the stricter global CORS sees it.
+_RAG_PUBLIC_PATH = "/v1/rag/chat"
+
+
+@app.middleware("http")
+async def _rag_widget_cors(request: Request, call_next):
+    from starlette.responses import Response
+
+    if request.url.path == _RAG_PUBLIC_PATH:
+        if request.method == "OPTIONS":
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Widget-Token",
+                    "Access-Control-Max-Age": "86400",
+                },
+            )
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+    return await call_next(request)
+
 app.include_router(auth.router)
 app.include_router(chats.router)
 app.include_router(upload.router)
@@ -143,7 +176,7 @@ app.include_router(admin.router)       # /admin/* — platform admin control pan
 app.include_router(features.router)    # /features — public read of platform feature flags
 app.include_router(broadcast.router)   # /broadcast — public read of the active announcement
 app.include_router(invite.router)      # /invite/* — invite-link check + accept (onboarding)
-app.include_router(business.router)    # /admin/business/* + /business/* — B2B RAG API
+app.include_router(kb.router)          # /api-keys/{id}/kb + /v1/rag/chat + /plans — per-app RAG
 
 # Telegram bridge (optional): starts a polling thread when TELEGRAM_BOT_TOKEN is set.
 from app.services.telegram_bot import start_telegram_bridge  # noqa: E402
