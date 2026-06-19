@@ -39,6 +39,7 @@ from app.models import (
     AuditLog,
     Broadcast,
     Invite,
+    KnowledgeDocument,
     OtpCode,
     SharedChat,
     User,
@@ -46,6 +47,12 @@ from app.models import (
     UserMemory,
     Webhook,
 )
+from app.api.routes.kb import (
+    PLANS as _KB_PLANS,
+    _PLAN_BY_KEY as _KB_PLAN_BY_KEY,
+    _collection_name as _kb_collection,
+)
+from app.services.chroma_service import delete_kb_collection, delete_kb_document_chunks
 from app.services.email_service import send_announcement_bulk, send_invite_email
 from app.services.feature_service import get_effective_features, set_features
 from app.services.webhook_service import WEBHOOK_EVENTS, deliver_test, dispatch_event
@@ -562,14 +569,320 @@ def admin_delete_key(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Permanently remove a key."""
+    """Permanently remove a key and its entire knowledge base (docs + vectors)."""
     rec = db.get(ApiKey, key_id)
     if rec is None:
         raise HTTPException(404, "Key not found.")
     owner = db.get(User, rec.user_id)
     prefix = rec.prefix
+    # Cascade: drop the app's documents + ChromaDB collection so nothing is orphaned.
+    db.query(KnowledgeDocument).filter(KnowledgeDocument.api_key_id == key_id).delete()
+    try:
+        delete_kb_collection(_kb_collection(key_id))
+    except Exception:
+        pass
     db.delete(rec)
     _record(db, admin, "apikey.delete", owner, detail=f"key {prefix}")
+    db.commit()
+    return {"ok": True}
+
+
+# ── Developer apps (super-admin: every ck_ key across all users + its KB) ──────
+# Each developer API key (ck_) is one "app" with an isolated knowledge base.
+# These endpoints give a platform admin a cross-tenant view: who owns which app,
+# what plan they're on, how many documents they uploaded, and the docs/activity.
+ENTERPRISE_DOC_LIMIT = 100000  # "unlimited" sentinel — don't flag these as full
+
+
+def _plan_meta(plan: Optional[str]) -> tuple:
+    p = _KB_PLAN_BY_KEY.get(plan or "free", _KB_PLAN_BY_KEY["free"])
+    return p["label"], p["doc_limit"]
+
+
+def _app_row(k: ApiKey, owner: Optional[User], doc_count: int, total_size: int) -> dict:
+    label, limit = _plan_meta(k.plan)
+    docs = int(doc_count or 0)
+    return {
+        "id": k.id,
+        "name": k.name,
+        "prefix": k.prefix,
+        "plan": k.plan or "free",
+        "plan_label": label,
+        "doc_count": docs,
+        "doc_limit": limit,
+        "near_limit": limit < ENTERPRISE_DOC_LIMIT and docs >= limit,
+        "total_size": int(total_size or 0),
+        "usage_count": k.usage_count or 0,
+        "total_tokens": k.total_tokens or 0,
+        "revoked": bool(k.revoked),
+        "widget_token": k.widget_token,
+        "created_at": k.created_at.isoformat() if k.created_at else None,
+        "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+        "owner_id": owner.id if owner else k.user_id,
+        "owner_email": owner.email if owner else None,
+        "owner_name": owner.name if owner else None,
+        "owner_api_blocked": bool(getattr(owner, "api_blocked", False)) if owner else False,
+        "owner_banned": bool(getattr(owner, "is_banned", False)) if owner else False,
+    }
+
+
+def _doc_stats(db: Session, key_ids: List[int]) -> tuple:
+    """Batch (count, total_size) of documents per api_key_id to avoid N+1."""
+    counts: Dict[int, int] = {}
+    sizes: Dict[int, int] = {}
+    if key_ids:
+        for kid, cnt, sz in (
+            db.query(
+                KnowledgeDocument.api_key_id,
+                func.count(KnowledgeDocument.id),
+                func.coalesce(func.sum(KnowledgeDocument.file_size), 0),
+            )
+            .filter(KnowledgeDocument.api_key_id.in_(key_ids))
+            .group_by(KnowledgeDocument.api_key_id)
+            .all()
+        ):
+            counts[kid] = cnt
+            sizes[kid] = sz
+    return counts, sizes
+
+
+@router.get("/apps")
+def list_apps(
+    q: str = Query("", description="search owner email/name or app name/prefix"),
+    plan: str = Query("", description="filter by plan key"),
+    status: str = Query("all", description="all | active | revoked"),
+    sort: str = Query("recent", description="recent | created | usage | docs"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = db.query(ApiKey, User).join(User, User.id == ApiKey.user_id)
+    term = q.strip().lower()
+    if term:
+        like = f"%{term}%"
+        query = query.filter(
+            func.lower(User.email).like(like)
+            | func.lower(User.name).like(like)
+            | func.lower(ApiKey.name).like(like)
+            | func.lower(ApiKey.prefix).like(like)
+        )
+    if plan.strip():
+        query = query.filter(ApiKey.plan == plan.strip())
+    if status == "active":
+        query = query.filter(ApiKey.revoked == False)  # noqa: E712
+    elif status == "revoked":
+        query = query.filter(ApiKey.revoked == True)  # noqa: E712
+
+    total = query.count()
+
+    if sort == "usage":
+        query = query.order_by(ApiKey.usage_count.desc())
+    elif sort == "created":
+        query = query.order_by(ApiKey.created_at.asc())
+    else:  # "recent" (default) and "docs" (re-sorted in Python below)
+        query = query.order_by(ApiKey.created_at.desc())
+
+    rows = query.offset(offset).limit(limit).all()
+    counts, sizes = _doc_stats(db, [k.id for k, _ in rows])
+    apps = [_app_row(k, u, counts.get(k.id, 0), sizes.get(k.id, 0)) for k, u in rows]
+    if sort == "docs":  # doc_count is aggregated, not a column — sort the page here
+        apps.sort(key=lambda a: a["doc_count"], reverse=True)
+
+    return {"total": total, "limit": limit, "offset": offset, "apps": apps}
+
+
+@router.get("/apps/summary")
+def apps_summary(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    total = db.query(func.count(ApiKey.id)).scalar() or 0
+    active = db.query(func.count(ApiKey.id)).filter(ApiKey.revoked == False).scalar() or 0  # noqa: E712
+    developers = db.query(func.count(func.distinct(ApiKey.user_id))).scalar() or 0
+    total_docs = db.query(func.count(KnowledgeDocument.id)).scalar() or 0
+    total_size = db.query(func.coalesce(func.sum(KnowledgeDocument.file_size), 0)).scalar() or 0
+    api_calls = db.query(func.coalesce(func.sum(ApiKey.usage_count), 0)).scalar() or 0
+
+    plan_counts: Dict[str, int] = {p["key"]: 0 for p in _KB_PLANS}
+    for plan_key, cnt in db.query(ApiKey.plan, func.count(ApiKey.id)).group_by(ApiKey.plan).all():
+        key = plan_key or "free"
+        plan_counts[key] = plan_counts.get(key, 0) + cnt
+
+    return {
+        "total_apps": total,
+        "active_apps": active,
+        "revoked_apps": total - active,
+        "developers": developers,
+        "total_docs": total_docs,
+        "total_size": int(total_size or 0),
+        "api_calls": api_calls,
+        "plans": [
+            {"key": p["key"], "label": p["label"], "price": p["price"], "count": plan_counts.get(p["key"], 0)}
+            for p in _KB_PLANS
+        ],
+    }
+
+
+@router.get("/api-keys/{key_id}/documents")
+def app_documents(
+    key_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "Key not found.")
+    owner = db.get(User, rec.user_id)
+    docs = (
+        db.query(KnowledgeDocument)
+        .filter(KnowledgeDocument.api_key_id == key_id)
+        .order_by(KnowledgeDocument.uploaded_at.desc())
+        .all()
+    )
+    label, limit = _plan_meta(rec.plan)
+    return {
+        "key_id": key_id,
+        "name": rec.name,
+        "plan": rec.plan or "free",
+        "plan_label": label,
+        "doc_limit": limit,
+        "owner_email": owner.email if owner else None,
+        "documents": [
+            {
+                "id": d.id,
+                "filename": d.filename,
+                "file_size": d.file_size or 0,
+                "chunk_count": d.chunk_count or 0,
+                "uploaded_at": d.uploaded_at.isoformat() if d.uploaded_at else None,
+            }
+            for d in docs
+        ],
+    }
+
+
+@router.get("/api-keys/{key_id}/activity")
+def app_activity(
+    key_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """A per-app timeline built from data we already keep: key creation, every
+    document upload, and the last API call. No new tracking table."""
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "Key not found.")
+
+    events: List[dict] = []
+    if rec.created_at:
+        events.append({"type": "app.created", "label": "App / key created",
+                       "at": rec.created_at.isoformat(), "detail": None})
+    docs = (
+        db.query(KnowledgeDocument)
+        .filter(KnowledgeDocument.api_key_id == key_id)
+        .order_by(KnowledgeDocument.uploaded_at.desc())
+        .all()
+    )
+    for d in docs:
+        events.append({
+            "type": "document.uploaded",
+            "label": f"Uploaded “{d.filename}”",
+            "at": d.uploaded_at.isoformat() if d.uploaded_at else None,
+            "detail": f"{d.chunk_count or 0} chunks",
+        })
+    if rec.last_used_at:
+        events.append({"type": "api.used", "label": "Most recent API call",
+                       "at": rec.last_used_at.isoformat(), "detail": f"{rec.usage_count or 0} calls total"})
+    events.sort(key=lambda e: e.get("at") or "", reverse=True)
+
+    label, limit = _plan_meta(rec.plan)
+    total_size = (
+        db.query(func.coalesce(func.sum(KnowledgeDocument.file_size), 0))
+        .filter(KnowledgeDocument.api_key_id == key_id)
+        .scalar()
+        or 0
+    )
+    return {
+        "key_id": key_id,
+        "events": events,
+        "footprint": {
+            "plan": rec.plan or "free",
+            "plan_label": label,
+            "doc_count": len(docs),
+            "doc_limit": limit,
+            "total_size": int(total_size),
+            "usage_count": rec.usage_count or 0,
+            "total_tokens": rec.total_tokens or 0,
+        },
+    }
+
+
+class AppPatch(BaseModel):
+    plan: Optional[str] = None
+    name: Optional[str] = None
+
+
+@router.patch("/api-keys/{key_id}")
+def admin_update_key(
+    key_id: int,
+    req: AppPatch,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin override of a developer's app: change its plan (no payment system
+    yet, so the admin grants plans manually) and/or rename it."""
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "Key not found.")
+    owner = db.get(User, rec.user_id)
+
+    changes: List[str] = []
+    if req.plan is not None:
+        if req.plan not in _KB_PLAN_BY_KEY:
+            raise HTTPException(400, f"Unknown plan '{req.plan}'.")
+        if (rec.plan or "free") != req.plan:
+            changes.append(f"plan {rec.plan or 'free'}→{req.plan}")
+            rec.plan = req.plan
+    if req.name is not None and req.name.strip() and req.name.strip() != rec.name:
+        rec.name = req.name.strip()[:60]
+        changes.append("rename")
+
+    if changes:
+        _record(db, admin, "apikey.update", owner, detail=f"key {rec.prefix}: {', '.join(changes)}")
+        db.commit()
+        db.refresh(rec)
+
+    counts, sizes = _doc_stats(db, [rec.id])
+    return _app_row(rec, owner, counts.get(rec.id, 0), sizes.get(rec.id, 0))
+
+
+@router.delete("/api-keys/{key_id}/documents/{doc_id}")
+def admin_delete_document(
+    key_id: int,
+    doc_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Remove one document from an app's knowledge base — DB row, ChromaDB
+    vector chunks, and the stored file."""
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "Key not found.")
+    doc = db.get(KnowledgeDocument, doc_id)
+    if doc is None or doc.api_key_id != key_id:
+        raise HTTPException(404, "Document not found.")
+    owner = db.get(User, rec.user_id)
+    fname = doc.filename
+
+    try:
+        delete_kb_document_chunks(_kb_collection(key_id), doc.upload_uid)
+    except Exception:
+        pass  # vectors may already be gone — still remove the row + file
+    file_path = os.path.join("uploads", _kb_collection(key_id), f"{doc.upload_uid}_{doc.filename}")
+    try:
+        os.remove(file_path)
+    except FileNotFoundError:
+        pass
+
+    db.delete(doc)
+    _record(db, admin, "apikey.doc_delete", owner, detail=f"key {rec.prefix}: {fname}")
     db.commit()
     return {"ok": True}
 
