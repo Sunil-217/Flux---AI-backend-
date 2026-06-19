@@ -11,13 +11,14 @@ so an admin can never accidentally lock the whole platform out of its own panel.
 
 import json
 import os
+import re
 import secrets
 import shutil
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -47,11 +48,9 @@ from app.models import (
     UserMemory,
     Webhook,
 )
-from app.api.routes.kb import (
-    PLANS as _KB_PLANS,
-    _PLAN_BY_KEY as _KB_PLAN_BY_KEY,
-    _collection_name as _kb_collection,
-)
+from app.api.routes.kb import _collection_name as _kb_collection
+from app.models import Plan
+from app.services import plan_service
 from app.services.chroma_service import delete_kb_collection, delete_kb_document_chunks
 from app.services.email_service import send_announcement_bulk, send_invite_email
 from app.services.feature_service import get_effective_features, set_features
@@ -591,16 +590,16 @@ def admin_delete_key(
 # Each developer API key (ck_) is one "app" with an isolated knowledge base.
 # These endpoints give a platform admin a cross-tenant view: who owns which app,
 # what plan they're on, how many documents they uploaded, and the docs/activity.
-ENTERPRISE_DOC_LIMIT = 100000  # "unlimited" sentinel — don't flag these as full
+ENTERPRISE_DOC_LIMIT = plan_service.UNLIMITED_DOC_LIMIT  # don't flag uncapped plans as full
 
 
-def _plan_meta(plan: Optional[str]) -> tuple:
-    p = _KB_PLAN_BY_KEY.get(plan or "free", _KB_PLAN_BY_KEY["free"])
-    return p["label"], p["doc_limit"]
+def _plan_meta(plan_map: dict, plan: Optional[str]) -> tuple:
+    p = plan_map.get(plan or "free") or plan_map.get("free") or {}
+    return p.get("label", "Free"), int(p.get("doc_limit", 1))
 
 
-def _app_row(k: ApiKey, owner: Optional[User], doc_count: int, total_size: int) -> dict:
-    label, limit = _plan_meta(k.plan)
+def _app_row(k: ApiKey, owner: Optional[User], doc_count: int, total_size: int, plan_map: dict) -> dict:
+    label, limit = _plan_meta(plan_map, k.plan)
     docs = int(doc_count or 0)
     return {
         "id": k.id,
@@ -685,7 +684,8 @@ def list_apps(
 
     rows = query.offset(offset).limit(limit).all()
     counts, sizes = _doc_stats(db, [k.id for k, _ in rows])
-    apps = [_app_row(k, u, counts.get(k.id, 0), sizes.get(k.id, 0)) for k, u in rows]
+    pmap = plan_service.get_plan_map(db)
+    apps = [_app_row(k, u, counts.get(k.id, 0), sizes.get(k.id, 0), pmap) for k, u in rows]
     if sort == "docs":  # doc_count is aggregated, not a column — sort the page here
         apps.sort(key=lambda a: a["doc_count"], reverse=True)
 
@@ -701,7 +701,8 @@ def apps_summary(admin: User = Depends(require_admin), db: Session = Depends(get
     total_size = db.query(func.coalesce(func.sum(KnowledgeDocument.file_size), 0)).scalar() or 0
     api_calls = db.query(func.coalesce(func.sum(ApiKey.usage_count), 0)).scalar() or 0
 
-    plan_counts: Dict[str, int] = {p["key"]: 0 for p in _KB_PLANS}
+    all_plans = plan_service.get_plans(db, include_inactive=True)
+    plan_counts: Dict[str, int] = {p["key"]: 0 for p in all_plans}
     for plan_key, cnt in db.query(ApiKey.plan, func.count(ApiKey.id)).group_by(ApiKey.plan).all():
         key = plan_key or "free"
         plan_counts[key] = plan_counts.get(key, 0) + cnt
@@ -716,7 +717,7 @@ def apps_summary(admin: User = Depends(require_admin), db: Session = Depends(get
         "api_calls": api_calls,
         "plans": [
             {"key": p["key"], "label": p["label"], "price": p["price"], "count": plan_counts.get(p["key"], 0)}
-            for p in _KB_PLANS
+            for p in all_plans
         ],
     }
 
@@ -737,7 +738,7 @@ def app_documents(
         .order_by(KnowledgeDocument.uploaded_at.desc())
         .all()
     )
-    label, limit = _plan_meta(rec.plan)
+    label, limit = _plan_meta(plan_service.get_plan_map(db), rec.plan)
     return {
         "key_id": key_id,
         "name": rec.name,
@@ -792,7 +793,7 @@ def app_activity(
                        "at": rec.last_used_at.isoformat(), "detail": f"{rec.usage_count or 0} calls total"})
     events.sort(key=lambda e: e.get("at") or "", reverse=True)
 
-    label, limit = _plan_meta(rec.plan)
+    label, limit = _plan_meta(plan_service.get_plan_map(db), rec.plan)
     total_size = (
         db.query(func.coalesce(func.sum(KnowledgeDocument.file_size), 0))
         .filter(KnowledgeDocument.api_key_id == key_id)
@@ -835,7 +836,7 @@ def admin_update_key(
 
     changes: List[str] = []
     if req.plan is not None:
-        if req.plan not in _KB_PLAN_BY_KEY:
+        if req.plan not in plan_service.get_plan_map(db):
             raise HTTPException(400, f"Unknown plan '{req.plan}'.")
         if (rec.plan or "free") != req.plan:
             changes.append(f"plan {rec.plan or 'free'}→{req.plan}")
@@ -850,7 +851,7 @@ def admin_update_key(
         db.refresh(rec)
 
     counts, sizes = _doc_stats(db, [rec.id])
-    return _app_row(rec, owner, counts.get(rec.id, 0), sizes.get(rec.id, 0))
+    return _app_row(rec, owner, counts.get(rec.id, 0), sizes.get(rec.id, 0), plan_service.get_plan_map(db))
 
 
 @router.delete("/api-keys/{key_id}/documents/{doc_id}")
@@ -883,6 +884,136 @@ def admin_delete_document(
 
     db.delete(doc)
     _record(db, admin, "apikey.doc_delete", owner, detail=f"key {rec.prefix}: {fname}")
+    db.commit()
+    return {"ok": True}
+
+
+# ── Plan management (super-admin: edit pricing + services for app tiers) ───────
+# Plans live in the `plans` table (plan_service). doc_limit is enforced on upload
+# and rate_limit on the public API, so editing here changes real behaviour — not
+# just the pricing page.
+_PLAN_KEY_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+def _plan_app_counts(db: Session) -> Dict[str, int]:
+    return {
+        (k or "free"): c
+        for k, c in db.query(ApiKey.plan, func.count(ApiKey.id)).group_by(ApiKey.plan).all()
+    }
+
+
+def _plan_out(p: dict, app_count: int) -> dict:
+    return {**p, "app_count": app_count}
+
+
+def _clean_features(feats: Optional[List[str]]) -> str:
+    cleaned = [str(f).strip() for f in (feats or []) if str(f).strip()][:20]
+    return json.dumps(cleaned)
+
+
+class PlanIn(BaseModel):
+    key: str = Field(min_length=1, max_length=30)
+    label: str = Field(min_length=1, max_length=40)
+    price: str = Field(default="₹0", max_length=40)
+    doc_limit: int = Field(default=1, ge=0, le=1_000_000)
+    rate_limit: int = Field(default=20, ge=1, le=100_000)
+    blurb: str = Field(default="", max_length=200)
+    features: List[str] = Field(default_factory=list)
+    highlighted: bool = False
+    active: bool = True
+
+
+class PlanPatch(BaseModel):
+    label: Optional[str] = Field(default=None, max_length=40)
+    price: Optional[str] = Field(default=None, max_length=40)
+    doc_limit: Optional[int] = Field(default=None, ge=0, le=1_000_000)
+    rate_limit: Optional[int] = Field(default=None, ge=1, le=100_000)
+    blurb: Optional[str] = Field(default=None, max_length=200)
+    features: Optional[List[str]] = None
+    highlighted: Optional[bool] = None
+    active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+@router.get("/plans")
+def admin_list_plans(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    counts = _plan_app_counts(db)
+    plans = plan_service.get_plans(db, include_inactive=True)
+    return {"plans": [_plan_out(p, counts.get(p["key"], 0)) for p in plans]}
+
+
+@router.post("/plans")
+def admin_create_plan(req: PlanIn, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    key = req.key.strip().lower()
+    if not _PLAN_KEY_RE.match(key):
+        raise HTTPException(400, "Plan key must be lowercase letters, numbers, or underscores.")
+    if db.query(Plan).filter(Plan.key == key).first() is not None:
+        raise HTTPException(400, f"A plan with key '{key}' already exists.")
+    max_order = db.query(func.coalesce(func.max(Plan.sort_order), -1)).scalar()
+    p = Plan(
+        key=key, label=req.label.strip(), price=(req.price.strip() or "₹0"),
+        doc_limit=req.doc_limit, rate_limit=req.rate_limit, blurb=req.blurb.strip(),
+        features=_clean_features(req.features), sort_order=int(max_order) + 1,
+        active=req.active, highlighted=req.highlighted,
+    )
+    db.add(p)
+    _record(db, admin, "plan.create", detail=f"plan {key} ({req.label.strip()})")
+    db.commit()
+    db.refresh(p)
+    counts = _plan_app_counts(db)
+    return _plan_out(plan_service._to_dict(p), counts.get(key, 0))
+
+
+@router.patch("/plans/{key}")
+def admin_update_plan(key: str, req: PlanPatch, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    p = db.query(Plan).filter(Plan.key == key).first()
+    if p is None:
+        raise HTTPException(404, "Plan not found.")
+    # The 'free' tier is the default fallback for every new key — keep it usable.
+    if key == "free" and req.active is False:
+        raise HTTPException(400, "The Free plan is the default tier and can't be deactivated.")
+
+    changes: List[str] = []
+    if req.label is not None and req.label.strip():
+        p.label = req.label.strip(); changes.append("label")
+    if req.price is not None:
+        p.price = req.price.strip() or "₹0"; changes.append("price")
+    if req.doc_limit is not None:
+        p.doc_limit = req.doc_limit; changes.append("doc_limit")
+    if req.rate_limit is not None:
+        p.rate_limit = req.rate_limit; changes.append("rate_limit")
+    if req.blurb is not None:
+        p.blurb = req.blurb.strip(); changes.append("blurb")
+    if req.features is not None:
+        p.features = _clean_features(req.features); changes.append("features")
+    if req.highlighted is not None:
+        p.highlighted = req.highlighted; changes.append("highlighted")
+    if req.active is not None:
+        p.active = req.active; changes.append("active")
+    if req.sort_order is not None:
+        p.sort_order = req.sort_order; changes.append("sort_order")
+
+    if changes:
+        p.updated_at = datetime.utcnow()
+        _record(db, admin, "plan.update", detail=f"plan {key}: {', '.join(changes)}")
+        db.commit()
+        db.refresh(p)
+    counts = _plan_app_counts(db)
+    return _plan_out(plan_service._to_dict(p), counts.get(key, 0))
+
+
+@router.delete("/plans/{key}")
+def admin_delete_plan(key: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    if key == "free":
+        raise HTTPException(400, "The Free plan is the default tier and can't be deleted.")
+    p = db.query(Plan).filter(Plan.key == key).first()
+    if p is None:
+        raise HTTPException(404, "Plan not found.")
+    in_use = db.query(func.count(ApiKey.id)).filter(ApiKey.plan == key).scalar() or 0
+    if in_use:
+        raise HTTPException(400, f"{in_use} app(s) are on this plan — move them to another plan first.")
+    db.delete(p)
+    _record(db, admin, "plan.delete", detail=f"plan {key}")
     db.commit()
     return {"ok": True}
 

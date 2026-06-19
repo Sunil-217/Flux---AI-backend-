@@ -96,8 +96,21 @@ def _bootstrap_admins():
         db.close()
 
 
+def _seed_plans():
+    """Populate the plans table from defaults on first boot (idempotent)."""
+    db = SessionLocal()
+    try:
+        from app.services.plan_service import seed_default_plans
+        seed_default_plans(db)
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 _ensure_schema()
 _bootstrap_admins()
+_seed_plans()
 
 app = FastAPI()
 

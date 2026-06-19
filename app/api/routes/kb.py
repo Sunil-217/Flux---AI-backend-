@@ -41,6 +41,7 @@ from app.services.chroma_service import (
 from app.services.embedding_service import chunk_text, create_embeddings
 from app.services.pdf_service import extract_text_from_file
 from app.services.rag_service import ask_kb_question
+from app.services import plan_service
 
 router = APIRouter()
 
@@ -53,21 +54,9 @@ ALLOWED_EXTENSIONS = [
 ]
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 
-# Plan tiers. doc_limit governs how many documents an app's knowledge base may
-# hold. No payment integration yet — everyone is on "free"; paid tiers are
-# display-only upgrades surfaced in the UI.
-PLANS = [
-    {"key": "free",       "label": "Free",       "price": "₹0",        "doc_limit": 1,      "blurb": "1 document, embeddable chat widget"},
-    {"key": "go",         "label": "Go",         "price": "₹299/mo",   "doc_limit": 3,      "blurb": "3 documents, higher rate limits"},
-    {"key": "pro",        "label": "Pro",        "price": "₹799/mo",   "doc_limit": 7,      "blurb": "7 documents, priority answers"},
-    {"key": "max",        "label": "Max",        "price": "₹1,499/mo", "doc_limit": 10,     "blurb": "10 documents, analytics"},
-    {"key": "enterprise", "label": "Enterprise", "price": "Custom",    "doc_limit": 100000, "blurb": "Unlimited documents, SSO, SLA"},
-]
-_PLAN_BY_KEY = {p["key"]: p for p in PLANS}
-
-
-def _doc_limit(plan: Optional[str]) -> int:
-    return _PLAN_BY_KEY.get(plan or "free", _PLAN_BY_KEY["free"])["doc_limit"]
+# Plan tiers now live in the DB (admin-editable) — see app/services/plan_service.py.
+# doc_limit governs how many documents an app's knowledge base may hold and is
+# enforced on upload below.
 
 
 def _collection_name(key_id: int) -> str:
@@ -140,8 +129,8 @@ def _doc_row(d: KnowledgeDocument) -> dict:
 # ── Plans (public) ────────────────────────────────────────────────────────────
 
 @router.get("/plans")
-def list_plans():
-    return {"plans": PLANS}
+def list_plans(db: Session = Depends(get_db)):
+    return {"plans": plan_service.get_plans(db)}
 
 
 # ── KB info + documents (owner, JWT) ──────────────────────────────────────────
@@ -165,7 +154,7 @@ def get_kb(
         "key_id": rec.id,
         "name": rec.name,
         "plan": plan,
-        "doc_limit": _doc_limit(plan),
+        "doc_limit": plan_service.doc_limit_for(db, plan),
         "doc_count": len(docs),
         "widget_token": widget_token,
         "documents": [_doc_row(d) for d in docs],
@@ -181,11 +170,11 @@ async def upload_kb_document(
 ):
     rec = _owned_key(key_id, user, db)
     plan = getattr(rec, "plan", None) or "free"
-    limit = _doc_limit(plan)
+    limit = plan_service.doc_limit_for(db, plan)
 
     current = db.query(KnowledgeDocument).filter_by(api_key_id=rec.id).count()
     if current >= limit:
-        plan_label = _PLAN_BY_KEY.get(plan, _PLAN_BY_KEY["free"])["label"]
+        plan_label = plan_service.plan_label(db, plan)
         raise HTTPException(
             status_code=403,
             detail=(

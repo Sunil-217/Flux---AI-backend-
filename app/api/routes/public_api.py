@@ -33,6 +33,7 @@ from app.services.rag_service import (
     client as nvidia_client,
     _groq_or_nvidia,
 )
+from app.services import plan_service
 
 router = APIRouter()
 
@@ -44,18 +45,19 @@ MODEL_ALIASES = {
 DEFAULT_ALIAS = "close-chat"
 
 # Per-key sliding-window rate limit. In-memory: fine for a single uvicorn
-# worker; swap for Redis if this ever runs multi-worker.
-RATE_LIMIT_PER_MIN = 20
+# worker; swap for Redis if this ever runs multi-worker. The per-minute ceiling
+# comes from the key's plan (plan_service), so upgrading a plan lifts the limit.
+RATE_LIMIT_PER_MIN = 20  # fallback when a plan can't be resolved
 _windows: dict[int, deque] = defaultdict(deque)
 
 
-def _check_rate(key_id: int) -> None:
+def _check_rate(key_id: int, limit: int = RATE_LIMIT_PER_MIN) -> None:
     now = time.time()
     win = _windows[key_id]
     while win and now - win[0] > 60:
         win.popleft()
-    if len(win) >= RATE_LIMIT_PER_MIN:
-        raise HTTPException(429, "Rate limit exceeded (20 requests/min). Slow down.")
+    if len(win) >= limit:
+        raise HTTPException(429, f"Rate limit exceeded ({limit} requests/min). Slow down or upgrade your plan.")
     win.append(now)
 
 
@@ -75,7 +77,7 @@ def require_api_key(
     owner = db.get(User, rec.user_id)
     if owner is None or getattr(owner, "api_blocked", False) or getattr(owner, "is_banned", False):
         raise HTTPException(403, "API access for this account has been blocked.")
-    _check_rate(rec.id)
+    _check_rate(rec.id, plan_service.rate_limit_for(db, rec.plan))
     return rec
 
 

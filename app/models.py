@@ -215,3 +215,28 @@ class KnowledgeDocument(Base):
     chunk_count = Column(Integer, default=0, nullable=False)
     upload_uid = Column(String, nullable=False)             # prefix used for ChromaDB chunk IDs
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Plan(Base):
+    """A subscription plan tier for developer apps (knowledge-base RAG).
+
+    Editable by admins from the Plans tab — price, document limit, API rate
+    limit, and the list of services it provides. Seeded from defaults on first
+    boot (see plan_service.seed_default_plans) so the table is never empty.
+    `features` is a JSON array of service strings shown on the pricing card.
+    `doc_limit` is ENFORCED on upload; `rate_limit` is ENFORCED on the public API."""
+
+    __tablename__ = "plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String, unique=True, index=True, nullable=False)  # free, go, pro…
+    label = Column(String, nullable=False)
+    price = Column(String, nullable=False, default="₹0")           # display string
+    doc_limit = Column(Integer, nullable=False, default=1)
+    rate_limit = Column(Integer, nullable=False, default=20)       # API requests / minute
+    blurb = Column(String, nullable=True)
+    features = Column(Text, nullable=False, default="[]")          # JSON array of strings
+    sort_order = Column(Integer, nullable=False, default=0)
+    active = Column(Boolean, nullable=False, default=True)         # hidden from pricing when false
+    highlighted = Column(Boolean, nullable=False, default=False)   # "most popular" badge
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
