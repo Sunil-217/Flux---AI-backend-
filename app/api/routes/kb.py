@@ -19,9 +19,11 @@ Auth for /v1/rag/chat accepts either the public widget token
 Plans are display-only for now (no payment) — Free allows 1 doc.
 """
 
+import json
 import os
 import re
 import uuid
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
@@ -131,6 +133,136 @@ def _doc_row(d: KnowledgeDocument) -> dict:
 @router.get("/plans")
 def list_plans(db: Session = Depends(get_db)):
     return {"plans": plan_service.get_plans(db)}
+
+
+# ── Widget appearance config (owner edits instant fields; embed page reads) ────
+# Custom CSS is special: it is NOT applied live on save. It goes through a
+# super-admin review (cssStatus pending→approved/rejected) so arbitrary CSS can't
+# hit our embed origin unreviewed. Only `customCss` (the approved copy) is ever
+# served publicly; `customCssPending` is the under-review submission.
+_WIDGET_TEXT_LIMITS = {"title": 60, "subtitle": 40, "greeting": 80, "tagline": 160, "theme": 30}
+_HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+# Instant (no-review) fields the owner may edit directly.
+_PUBLIC_FIELDS = ("title", "subtitle", "greeting", "tagline", "accent", "theme", "suggestions", "logoUrl", "customCss")
+
+
+def _clean_css(css: str) -> str:
+    """CSS only — strip anything that could close the <style> tag or smuggle
+    markup/script onto our embed origin; clamp size."""
+    cleaned = re.sub(r"</\s*style", "", css or "", flags=re.I)
+    cleaned = re.sub(r"<\s*script", "", cleaned, flags=re.I)
+    return cleaned[:4000]
+
+
+def _sanitize_widget_config(raw: dict) -> dict:
+    """Validate the INSTANT (non-CSS) appearance fields the owner edits directly.
+    Custom CSS is handled separately via the review endpoint, never here."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for field, limit in _WIDGET_TEXT_LIMITS.items():
+        if raw.get(field) is not None:
+            out[field] = str(raw[field])[:limit]
+    accent = raw.get("accent")
+    if isinstance(accent, str) and _HEX_RE.match(accent.strip()):
+        out["accent"] = accent.strip()
+    logo = raw.get("logoUrl")
+    if isinstance(logo, str):
+        logo = logo.strip()[:600]
+        # Only allow https images or inline data: URIs (no javascript:/http:).
+        if logo == "" or logo.startswith("https://") or logo.startswith("data:image/"):
+            out["logoUrl"] = logo
+    sugg = raw.get("suggestions")
+    if isinstance(sugg, list):
+        out["suggestions"] = [str(s)[:80] for s in sugg if str(s).strip()][:6]
+    return out
+
+
+def _read_widget_config(rec: ApiKey) -> dict:
+    try:
+        cfg = json.loads(rec.widget_config) if rec.widget_config else {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _public_view(cfg: dict) -> dict:
+    """The render-only view served to the embedded widget — approved CSS only,
+    never the pending submission. Branding is always on (handled client-side)."""
+    return {k: cfg[k] for k in _PUBLIC_FIELDS if k in cfg}
+
+
+class WidgetConfigPayload(BaseModel):
+    config: dict
+
+
+class WidgetCssPayload(BaseModel):
+    css: str = ""
+
+
+@router.get("/api-keys/{key_id}/widget")
+def get_widget_config(key_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Owner sees everything incl. the review state (pending CSS, status, note).
+    rec = _owned_key(key_id, user, db)
+    return {"config": _read_widget_config(rec)}
+
+
+@router.put("/api-keys/{key_id}/widget")
+def save_widget_config(
+    key_id: int,
+    payload: WidgetConfigPayload,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Save the instant appearance fields. Merges over existing config so the
+    CSS review state (managed elsewhere) is preserved."""
+    rec = _owned_key(key_id, user, db)
+    existing = _read_widget_config(rec)
+    clean = _sanitize_widget_config(payload.config or {})
+    merged = {**existing, **clean}
+    rec.widget_config = json.dumps(merged)
+    db.commit()
+    return {"config": merged}
+
+
+@router.post("/api-keys/{key_id}/widget/css")
+def submit_widget_css(
+    key_id: int,
+    payload: WidgetCssPayload,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Submit custom CSS for super-admin review. Clearing it (empty) is applied
+    immediately; otherwise it is held as 'pending' until an admin approves."""
+    rec = _owned_key(key_id, user, db)
+    cfg = _read_widget_config(rec)
+    css = _clean_css(payload.css or "")
+    if not css.strip():
+        # Removing styling is always safe — apply right away.
+        cfg["customCss"] = ""
+        cfg["customCssPending"] = ""
+        cfg["cssStatus"] = "none"
+        cfg["cssNote"] = ""
+    else:
+        cfg["customCssPending"] = css
+        cfg["cssStatus"] = "pending"
+        cfg["cssNote"] = ""
+        cfg["cssSubmittedAt"] = datetime.utcnow().isoformat()
+    rec.widget_config = json.dumps(cfg)
+    db.commit()
+    return {"config": cfg}
+
+
+@router.get("/v1/rag/config")
+def public_widget_config(app: str = "", db: Session = Depends(get_db)):
+    """Public appearance config for the embedded widget, resolved by widget token.
+    Returns empty (→ frontend defaults) for an unknown or revoked token."""
+    if not app:
+        return {"config": {}}
+    rec = db.query(ApiKey).filter(ApiKey.widget_token == app).first()
+    if rec is None or rec.revoked:
+        return {"config": {}}
+    return {"config": _public_view(_read_widget_config(rec))}
 
 
 # ── KB info + documents (owner, JWT) ──────────────────────────────────────────

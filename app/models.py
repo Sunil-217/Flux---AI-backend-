@@ -116,6 +116,9 @@ class ApiKey(Base):
     # quota. Stored in the clear (it is public by design) and recoverable so the
     # embed code can always be re-shown. Generated lazily for pre-existing keys.
     widget_token = Column(String, unique=True, index=True, nullable=True)
+    # JSON appearance config for the embeddable chat widget (title, theme, accent,
+    # greeting, suggested questions, custom CSS). Owner-editable; null = defaults.
+    widget_config = Column(Text, nullable=True)
 
 
 class FeatureFlag(Base):

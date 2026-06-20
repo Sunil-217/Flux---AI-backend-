@@ -48,7 +48,7 @@ from app.models import (
     UserMemory,
     Webhook,
 )
-from app.api.routes.kb import _collection_name as _kb_collection
+from app.api.routes.kb import _collection_name as _kb_collection, _read_widget_config
 from app.models import Plan
 from app.services import plan_service
 from app.services.chroma_service import delete_kb_collection, delete_kb_document_chunks
@@ -1014,6 +1014,78 @@ def admin_delete_plan(key: str, admin: User = Depends(require_admin), db: Sessio
         raise HTTPException(400, f"{in_use} app(s) are on this plan — move them to another plan first.")
     db.delete(p)
     _record(db, admin, "plan.delete", detail=f"plan {key}")
+    db.commit()
+    return {"ok": True}
+
+
+# ── Widget custom-CSS reviews (super-admin moderates dev-submitted CSS) ────────
+class CssRejectPayload(BaseModel):
+    note: str = ""
+
+
+def _css_review_item(k: ApiKey, owner: Optional[User], cfg: dict) -> dict:
+    return {
+        "key_id": k.id,
+        "app_name": k.name,
+        "prefix": k.prefix,
+        "owner_email": owner.email if owner else None,
+        "owner_name": owner.name if owner else None,
+        "pending_css": cfg.get("customCssPending", ""),
+        "current_css": cfg.get("customCss", ""),
+        "status": cfg.get("cssStatus", "none"),
+        "submitted_at": cfg.get("cssSubmittedAt"),
+    }
+
+
+@router.get("/css-reviews")
+def admin_css_reviews(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Every app with custom CSS awaiting review — the super-admin's moderation queue."""
+    rows = db.query(ApiKey).filter(ApiKey.widget_config.isnot(None)).all()
+    items = []
+    for k in rows:
+        cfg = _read_widget_config(k)
+        if cfg.get("cssStatus") == "pending":
+            items.append(_css_review_item(k, db.get(User, k.user_id), cfg))
+    items.sort(key=lambda x: x.get("submitted_at") or "", reverse=True)
+    return {"reviews": items, "pending": len(items)}
+
+
+@router.post("/css-reviews/{key_id}/approve")
+def admin_approve_css(key_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "App not found.")
+    cfg = _read_widget_config(rec)
+    if cfg.get("cssStatus") != "pending":
+        raise HTTPException(400, "No pending CSS to approve.")
+    cfg["customCss"] = cfg.get("customCssPending", "")
+    cfg["customCssPending"] = ""
+    cfg["cssStatus"] = "approved"
+    cfg["cssNote"] = ""
+    rec.widget_config = json.dumps(cfg)
+    _record(db, admin, "widget.css_approve", db.get(User, rec.user_id), detail=f"key {rec.prefix}")
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/css-reviews/{key_id}/reject")
+def admin_reject_css(
+    key_id: int,
+    req: CssRejectPayload,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    rec = db.get(ApiKey, key_id)
+    if rec is None:
+        raise HTTPException(404, "App not found.")
+    cfg = _read_widget_config(rec)
+    if cfg.get("cssStatus") != "pending":
+        raise HTTPException(400, "No pending CSS to reject.")
+    cfg["cssStatus"] = "rejected"
+    cfg["cssNote"] = (req.note or "").strip()[:300]
+    # Keep the pending CSS so the dev sees what was rejected; live CSS is untouched.
+    rec.widget_config = json.dumps(cfg)
+    _record(db, admin, "widget.css_reject", db.get(User, rec.user_id), detail=f"key {rec.prefix}: {(req.note or '')[:60]}")
     db.commit()
     return {"ok": True}
 

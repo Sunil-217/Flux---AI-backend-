@@ -51,6 +51,7 @@ def _ensure_schema():
         # Per-app RAG: plan tier + public widget token on each developer key.
         ("api_keys", "plan", "VARCHAR NOT NULL DEFAULT 'free'"),
         ("api_keys", "widget_token", "VARCHAR"),
+        ("api_keys", "widget_config", "TEXT"),
     ]
     try:
         insp = inspect(engine)
@@ -139,25 +140,26 @@ app.add_middleware(
 )
 
 
-# Open CORS for the embeddable RAG chat endpoint ONLY. The widget is loaded in
-# an iframe / called from arbitrary customer domains, and it authenticates with
-# a public, RAG-only widget token (not cookies), so reflecting any origin here
-# is safe and scoped. Added AFTER CORSMiddleware so it is the OUTERMOST layer —
-# it short-circuits the preflight before the stricter global CORS sees it.
-_RAG_PUBLIC_PATH = "/v1/rag/chat"
+# Open CORS for the embeddable widget endpoints ONLY (everything under /v1/rag/:
+# the RAG chat + the public appearance config). The widget is loaded in an iframe
+# / called from arbitrary customer domains, and it authenticates with a public,
+# RAG-only widget token (not cookies), so reflecting any origin here is safe and
+# scoped. Added AFTER CORSMiddleware so it is the OUTERMOST layer — it
+# short-circuits the preflight before the stricter global CORS sees it.
+_RAG_PUBLIC_PREFIX = "/v1/rag/"
 
 
 @app.middleware("http")
 async def _rag_widget_cors(request: Request, call_next):
     from starlette.responses import Response
 
-    if request.url.path == _RAG_PUBLIC_PATH:
+    if request.url.path.startswith(_RAG_PUBLIC_PREFIX):
         if request.method == "OPTIONS":
             return Response(
                 status_code=200,
                 headers={
                     "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                     "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Widget-Token",
                     "Access-Control-Max-Age": "86400",
                 },
