@@ -186,10 +186,14 @@ def _read_widget_config(rec: ApiKey) -> dict:
         return {}
 
 
-def _public_view(cfg: dict) -> dict:
+def _public_view(cfg: dict, rec: "ApiKey") -> dict:
     """The render-only view served to the embedded widget — approved CSS only,
-    never the pending submission. Branding is always on (handled client-side)."""
-    return {k: cfg[k] for k in _PUBLIC_FIELDS if k in cfg}
+    never the pending submission. Branding is always on (handled client-side).
+    The header title defaults to the app's own name when the dev hasn't set one."""
+    out = {k: cfg[k] for k in _PUBLIC_FIELDS if k in cfg}
+    if not (out.get("title") or "").strip():
+        out["title"] = rec.name
+    return out
 
 
 class WidgetConfigPayload(BaseModel):
@@ -262,7 +266,7 @@ def public_widget_config(app: str = "", db: Session = Depends(get_db)):
     rec = db.query(ApiKey).filter(ApiKey.widget_token == app).first()
     if rec is None or rec.revoked:
         return {"config": {}}
-    return {"config": _public_view(_read_widget_config(rec))}
+    return {"config": _public_view(_read_widget_config(rec), rec)}
 
 
 # ── KB info + documents (owner, JWT) ──────────────────────────────────────────
