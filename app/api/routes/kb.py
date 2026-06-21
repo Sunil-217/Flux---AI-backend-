@@ -718,10 +718,12 @@ class WidgetLeadRequest(BaseModel):
 @router.post("/v1/rag/lead")
 def submit_widget_lead(
     req: WidgetLeadRequest,
+    background: BackgroundTasks,
     app_key: ApiKey = Depends(_resolve_app),
     db: Session = Depends(get_db),
 ):
-    """Capture a visitor contact from the embedded widget (public, widget token)."""
+    """Capture a visitor contact from the embedded widget (public, widget token).
+    Notifies the app owner by email so a human can follow up (handoff)."""
     name = (req.name or "").strip()[:120]
     email = (req.email or "").strip()[:200]
     message = (req.message or "").strip()[:1000]
@@ -730,4 +732,9 @@ def submit_widget_lead(
     db.add(WidgetLead(api_key_id=app_key.id, name=name or None, email=email or None,
                       message=message or None, session_id=(req.session_id or None)))
     db.commit()
+    owner = db.get(User, app_key.user_id)
+    if owner and owner.email:
+        who = email or name or "A visitor"
+        body = f"{who} left a message on your “{app_key.name}” widget:\n\n{message or '(no message)'}\n\nReply to them at: {email or 'n/a'}"
+        background.add_task(send_announcement_email, owner.email, "New lead from your widget", body)
     return {"ok": True}

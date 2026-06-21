@@ -47,6 +47,8 @@ from app.models import (
     UserChats,
     UserMemory,
     Webhook,
+    WidgetMessage,
+    WidgetLead,
 )
 from app.api.routes.kb import _collection_name as _kb_collection, _read_widget_config
 from app.models import Plan
@@ -886,6 +888,58 @@ def admin_delete_document(
     _record(db, admin, "apikey.doc_delete", owner, detail=f"key {rec.prefix}: {fname}")
     db.commit()
     return {"ok": True}
+
+
+# ── Platform-wide widget analytics (super-admin: activity across ALL apps) ────
+@router.get("/widget-analytics")
+def admin_widget_analytics(
+    days: int = 30,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    days = max(1, min(days, 90))
+    since = datetime.utcnow() - timedelta(days=days)
+    q_user = db.query(WidgetMessage).filter(WidgetMessage.role == "user")
+    total_questions = q_user.count()
+    conversations = db.query(func.count(func.distinct(WidgetMessage.session_id))).scalar() or 0
+    leads = db.query(func.count(WidgetLead.id)).scalar() or 0
+    unanswered = (
+        db.query(func.count(WidgetMessage.id))
+        .filter(WidgetMessage.role == "assistant", WidgetMessage.answered == False)  # noqa: E712
+        .scalar()
+        or 0
+    )
+
+    recent = q_user.filter(WidgetMessage.created_at >= since).order_by(WidgetMessage.created_at.asc()).limit(8000).all()
+    by_day: Dict[str, int] = {}
+    for m in recent:
+        d = m.created_at.date().isoformat() if m.created_at else "?"
+        by_day[d] = by_day.get(d, 0) + 1
+
+    # Top apps by question volume.
+    rows = (
+        db.query(WidgetMessage.api_key_id, func.count(WidgetMessage.id))
+        .filter(WidgetMessage.role == "user")
+        .group_by(WidgetMessage.api_key_id)
+        .order_by(func.count(WidgetMessage.id).desc())
+        .limit(8)
+        .all()
+    )
+    names = {k.id: (k.name, k.prefix) for k in db.query(ApiKey).filter(ApiKey.id.in_([r[0] for r in rows])).all()} if rows else {}
+    top_apps = [
+        {"key_id": kid, "name": names.get(kid, ("(deleted)", ""))[0], "questions": cnt}
+        for kid, cnt in rows
+    ]
+
+    return {
+        "days": days,
+        "total_questions": total_questions,
+        "conversations": conversations,
+        "leads": leads,
+        "unanswered": unanswered,
+        "by_day": [{"date": d, "count": c} for d, c in sorted(by_day.items())],
+        "top_apps": top_apps,
+    }
 
 
 # ── Plan management (super-admin: edit pricing + services for app tiers) ───────
