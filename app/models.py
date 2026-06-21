@@ -220,6 +220,37 @@ class KnowledgeDocument(Base):
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class WidgetMessage(Base):
+    """One turn of an embedded-widget conversation, logged for the developer's
+    analytics + transcripts. Grouped into conversations by `session_id`."""
+
+    __tablename__ = "widget_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    api_key_id = Column(Integer, index=True, nullable=False)  # references api_keys.id
+    session_id = Column(String, index=True, nullable=False)   # one widget conversation
+    role = Column(String, nullable=False)                     # "user" | "assistant"
+    content = Column(Text, nullable=False)
+    feedback = Column(Integer, default=0, nullable=False)     # visitor rating: 1 up / -1 down / 0 none
+    answered = Column(Boolean, default=True, nullable=False)  # assistant: did the KB have an answer?
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class WidgetLead(Base):
+    """A contact captured by an app's embedded chat widget (name / email /
+    message), surfaced to the developer in the console."""
+
+    __tablename__ = "widget_leads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    api_key_id = Column(Integer, index=True, nullable=False)  # references api_keys.id
+    name = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    message = Column(Text, nullable=True)
+    session_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Plan(Base):
     """A subscription plan tier for developer apps (knowledge-base RAG).
 

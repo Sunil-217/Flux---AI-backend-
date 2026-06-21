@@ -52,7 +52,7 @@ from app.api.routes.kb import _collection_name as _kb_collection, _read_widget_c
 from app.models import Plan
 from app.services import plan_service
 from app.services.chroma_service import delete_kb_collection, delete_kb_document_chunks
-from app.services.email_service import send_announcement_bulk, send_invite_email
+from app.services.email_service import send_announcement_bulk, send_announcement_email, send_invite_email
 from app.services.feature_service import get_effective_features, set_features
 from app.services.webhook_service import WEBHOOK_EVENTS, deliver_test, dispatch_event
 
@@ -1051,7 +1051,12 @@ def admin_css_reviews(admin: User = Depends(require_admin), db: Session = Depend
 
 
 @router.post("/css-reviews/{key_id}/approve")
-def admin_approve_css(key_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def admin_approve_css(
+    key_id: int,
+    background: BackgroundTasks,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     rec = db.get(ApiKey, key_id)
     if rec is None:
         raise HTTPException(404, "App not found.")
@@ -1063,8 +1068,14 @@ def admin_approve_css(key_id: int, admin: User = Depends(require_admin), db: Ses
     cfg["cssStatus"] = "approved"
     cfg["cssNote"] = ""
     rec.widget_config = json.dumps(cfg)
-    _record(db, admin, "widget.css_approve", db.get(User, rec.user_id), detail=f"key {rec.prefix}")
+    owner = db.get(User, rec.user_id)
+    _record(db, admin, "widget.css_approve", owner, detail=f"key {rec.prefix}")
     db.commit()
+    if owner and owner.email:
+        background.add_task(
+            send_announcement_email, owner.email, "Your widget CSS was approved",
+            f"Your custom CSS for the app “{rec.name}” has been approved and is now live on your widget. 🎉",
+        )
     return {"ok": True}
 
 
@@ -1072,6 +1083,7 @@ def admin_approve_css(key_id: int, admin: User = Depends(require_admin), db: Ses
 def admin_reject_css(
     key_id: int,
     req: CssRejectPayload,
+    background: BackgroundTasks,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -1081,12 +1093,20 @@ def admin_reject_css(
     cfg = _read_widget_config(rec)
     if cfg.get("cssStatus") != "pending":
         raise HTTPException(400, "No pending CSS to reject.")
+    note = (req.note or "").strip()[:300]
     cfg["cssStatus"] = "rejected"
-    cfg["cssNote"] = (req.note or "").strip()[:300]
+    cfg["cssNote"] = note
     # Keep the pending CSS so the dev sees what was rejected; live CSS is untouched.
     rec.widget_config = json.dumps(cfg)
-    _record(db, admin, "widget.css_reject", db.get(User, rec.user_id), detail=f"key {rec.prefix}: {(req.note or '')[:60]}")
+    owner = db.get(User, rec.user_id)
+    _record(db, admin, "widget.css_reject", owner, detail=f"key {rec.prefix}: {note[:60]}")
     db.commit()
+    if owner and owner.email:
+        background.add_task(
+            send_announcement_email, owner.email, "Your widget CSS needs changes",
+            f"Your custom CSS for the app “{rec.name}” was not approved.\n\n"
+            f"Reason: {note or 'not specified'}\n\nEdit it and resubmit in the Developer Console → Appearance.",
+        )
     return {"ok": True}
 
 

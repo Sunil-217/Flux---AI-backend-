@@ -1098,6 +1098,47 @@ def ask_kb_question(collection_name: str, question: str, history: list = []) -> 
     return _rag_chat(collection, question, history)
 
 
+def suggest_starter_questions(collection_name: str) -> list:
+    """Propose a few short starter questions for the widget, grounded in the app's
+    own knowledge base. Returns [] if there are no docs or generation fails."""
+    from app.services.chroma_service import get_or_create_kb_collection
+
+    collection = get_or_create_kb_collection(collection_name)
+    if collection.count() == 0:
+        return []
+    try:
+        sample = collection.get(limit=12, include=["documents"])
+        docs = [d for d in (sample.get("documents") or []) if d]
+    except Exception:
+        docs = []
+    context = "\n\n".join(docs)[:3500]
+    if not context.strip():
+        return []
+
+    prompt = (
+        "Based ONLY on the content below, write 3 short questions a visitor might ask "
+        "this assistant. Keep each under 8 words. Return one question per line, with no "
+        "numbering or extra text.\n\nCONTENT:\n" + context
+    )
+    try:
+        resp = _groq_or_nvidia().chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=140,
+            temperature=0.4,
+        )
+        text = resp.choices[0].message.content or ""
+    except Exception:
+        return []
+
+    out = []
+    for line in text.splitlines():
+        q = line.strip().lstrip("0123456789.)-•* ").strip().strip('"').strip()
+        if len(q) > 3:
+            out.append(q[:80])
+    return out[:3]
+
+
 # ── Streaming (token-by-token) — makes answers feel instant ─────────────────
 
 def _sse(payload: dict) -> str:

@@ -52,6 +52,8 @@ def _ensure_schema():
         ("api_keys", "plan", "VARCHAR NOT NULL DEFAULT 'free'"),
         ("api_keys", "widget_token", "VARCHAR"),
         ("api_keys", "widget_config", "TEXT"),
+        ("widget_messages", "feedback", "INTEGER NOT NULL DEFAULT 0"),
+        ("widget_messages", "answered", "BOOLEAN NOT NULL DEFAULT 1"),
     ]
     try:
         insp = inspect(engine)

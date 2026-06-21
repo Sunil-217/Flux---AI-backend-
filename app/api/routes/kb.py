@@ -19,22 +19,27 @@ Auth for /v1/rag/chat accepts either the public widget token
 Plans are display-only for now (no payment) — Free allows 1 doc.
 """
 
+import base64
 import json
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+from app.core.config import ADMIN_EMAILS
+from app.services.email_service import send_announcement_email
 from starlette.concurrency import run_in_threadpool
 
 from app.api.routes.apikeys import hash_key
 from app.core.security import get_current_user
 from app.db import get_db
-from app.models import ApiKey, KnowledgeDocument, User
+from app.models import ApiKey, KnowledgeDocument, User, WidgetMessage, WidgetLead
 from app.services.chroma_service import (
     delete_kb_collection,
     delete_kb_document_chunks,
@@ -42,7 +47,7 @@ from app.services.chroma_service import (
 )
 from app.services.embedding_service import chunk_text, create_embeddings
 from app.services.pdf_service import extract_text_from_file
-from app.services.rag_service import ask_kb_question
+from app.services.rag_service import ask_kb_question, suggest_starter_questions
 from app.services import plan_service
 
 router = APIRouter()
@@ -143,7 +148,7 @@ def list_plans(db: Session = Depends(get_db)):
 _WIDGET_TEXT_LIMITS = {"title": 60, "subtitle": 40, "greeting": 80, "tagline": 160, "theme": 30}
 _HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 # Instant (no-review) fields the owner may edit directly.
-_PUBLIC_FIELDS = ("title", "subtitle", "greeting", "tagline", "accent", "theme", "suggestions", "logoUrl", "customCss")
+_PUBLIC_FIELDS = ("title", "subtitle", "greeting", "tagline", "accent", "theme", "suggestions", "logoUrl", "customCss", "leadCapture", "leadPrompt")
 
 
 def _clean_css(css: str) -> str:
@@ -168,13 +173,18 @@ def _sanitize_widget_config(raw: dict) -> dict:
         out["accent"] = accent.strip()
     logo = raw.get("logoUrl")
     if isinstance(logo, str):
-        logo = logo.strip()[:600]
+        # Large cap so uploaded data: URIs (base64) survive a config save.
+        logo = logo.strip()[:400000]
         # Only allow https images or inline data: URIs (no javascript:/http:).
         if logo == "" or logo.startswith("https://") or logo.startswith("data:image/"):
             out["logoUrl"] = logo
     sugg = raw.get("suggestions")
     if isinstance(sugg, list):
         out["suggestions"] = [str(s)[:80] for s in sugg if str(s).strip()][:6]
+    if "leadCapture" in raw:
+        out["leadCapture"] = bool(raw["leadCapture"])
+    if raw.get("leadPrompt") is not None:
+        out["leadPrompt"] = str(raw["leadPrompt"])[:160]
     return out
 
 
@@ -233,6 +243,7 @@ def save_widget_config(
 def submit_widget_css(
     key_id: int,
     payload: WidgetCssPayload,
+    background: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -252,6 +263,14 @@ def submit_widget_css(
         cfg["cssStatus"] = "pending"
         cfg["cssNote"] = ""
         cfg["cssSubmittedAt"] = datetime.utcnow().isoformat()
+        # Notify the super-admin(s) there's something to review (non-blocking).
+        subject = "New widget CSS pending review"
+        body = (
+            f"{user.email} submitted custom CSS for the app “{rec.name}” ({rec.prefix}).\n\n"
+            "Review and approve or reject it in Admin → Code Reviews."
+        )
+        for admin_email in ADMIN_EMAILS:
+            background.add_task(send_announcement_email, admin_email, subject, body)
     rec.widget_config = json.dumps(cfg)
     db.commit()
     return {"config": cfg}
@@ -267,6 +286,207 @@ def public_widget_config(app: str = "", db: Session = Depends(get_db)):
     if rec is None or rec.revoked:
         return {"config": {}}
     return {"config": _public_view(_read_widget_config(rec), rec)}
+
+
+# ── Widget logo upload (owner) ────────────────────────────────────────────────
+_LOGO_TYPES = {"image/png", "image/jpeg", "image/svg+xml", "image/webp", "image/gif"}
+
+
+@router.post("/api-keys/{key_id}/widget/logo")
+async def upload_widget_logo(
+    key_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a logo image; stored inline as a base64 data: URI in the config so
+    it serves cross-origin to the embedded widget without separate file hosting."""
+    rec = _owned_key(key_id, user, db)
+    ct = (file.content_type or "").lower()
+    if ct not in _LOGO_TYPES:
+        raise HTTPException(400, "Logo must be a PNG, JPEG, SVG, WebP, or GIF image.")
+    data = await file.read()
+    if len(data) > 150 * 1024:
+        raise HTTPException(400, "Logo must be under 150 KB.")
+    data_uri = f"data:{ct};base64,{base64.b64encode(data).decode('ascii')}"
+    cfg = _read_widget_config(rec)
+    cfg["logoUrl"] = data_uri
+    rec.widget_config = json.dumps(cfg)
+    db.commit()
+    return {"logoUrl": data_uri}
+
+
+# ── Widget insights: analytics + conversations + leads (owner) ────────────────
+@router.get("/api-keys/{key_id}/analytics")
+def widget_analytics(
+    key_id: int,
+    days: int = 30,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rec = _owned_key(key_id, user, db)
+    days = max(1, min(days, 90))
+    since = datetime.utcnow() - timedelta(days=days)
+    user_msgs = db.query(WidgetMessage).filter(
+        WidgetMessage.api_key_id == rec.id, WidgetMessage.role == "user"
+    )
+    total = user_msgs.count()
+    sessions = (
+        db.query(func.count(func.distinct(WidgetMessage.session_id)))
+        .filter(WidgetMessage.api_key_id == rec.id).scalar() or 0
+    )
+    leads = db.query(func.count(WidgetLead.id)).filter(WidgetLead.api_key_id == rec.id).scalar() or 0
+    recent = user_msgs.filter(WidgetMessage.created_at >= since).order_by(WidgetMessage.created_at.asc()).limit(5000).all()
+
+    by_day: dict = {}
+    counts: dict = {}
+    for m in recent:
+        d = m.created_at.date().isoformat() if m.created_at else "?"
+        by_day[d] = by_day.get(d, 0) + 1
+        k = " ".join(m.content.strip().lower().split())[:120]
+        if k:
+            counts[k] = counts.get(k, 0) + 1
+    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:8]
+
+    # Helpfulness from 👍/👎 on assistant answers.
+    bot = lambda: db.query(func.count(WidgetMessage.id)).filter(  # noqa: E731
+        WidgetMessage.api_key_id == rec.id, WidgetMessage.role == "assistant"
+    )
+    helpful = bot().filter(WidgetMessage.feedback == 1).scalar() or 0
+    unhelpful = bot().filter(WidgetMessage.feedback == -1).scalar() or 0
+    unanswered_total = bot().filter(WidgetMessage.answered == False).scalar() or 0  # noqa: E712
+
+    # Content gaps: the visitor questions whose answer came back unanswered.
+    gap_bots = (
+        db.query(WidgetMessage)
+        .filter(WidgetMessage.api_key_id == rec.id, WidgetMessage.role == "assistant", WidgetMessage.answered == False)  # noqa: E712
+        .order_by(WidgetMessage.created_at.desc())
+        .limit(40)
+        .all()
+    )
+    gap_counts: dict = {}
+    for a in gap_bots:
+        u = (
+            db.query(WidgetMessage)
+            .filter(WidgetMessage.api_key_id == rec.id, WidgetMessage.session_id == a.session_id,
+                    WidgetMessage.role == "user", WidgetMessage.created_at <= a.created_at)
+            .order_by(WidgetMessage.created_at.desc())
+            .first()
+        )
+        if u:
+            k = " ".join(u.content.strip().lower().split())[:120]
+            if k:
+                gap_counts[k] = gap_counts.get(k, 0) + 1
+    gaps = sorted(gap_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+
+    return {
+        "total_questions": total,
+        "window_questions": len(recent),
+        "conversations": sessions,
+        "leads": leads,
+        "days": days,
+        "helpful": helpful,
+        "unhelpful": unhelpful,
+        "unanswered": unanswered_total,
+        "by_day": [{"date": d, "count": c} for d, c in sorted(by_day.items())],
+        "top_questions": [{"question": q, "count": c} for q, c in top],
+        "content_gaps": [{"question": q, "count": c} for q, c in gaps],
+    }
+
+
+@router.post("/api-keys/{key_id}/suggest-questions")
+def suggest_questions(
+    key_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """LLM-suggest a few starter questions from the app's uploaded documents."""
+    rec = _owned_key(key_id, user, db)
+    return {"questions": suggest_starter_questions(_collection_name(rec.id))}
+
+
+@router.get("/api-keys/{key_id}/conversations")
+def widget_conversations(
+    key_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rec = _owned_key(key_id, user, db)
+    rows = (
+        db.query(
+            WidgetMessage.session_id,
+            func.count(WidgetMessage.id),
+            func.min(WidgetMessage.created_at),
+            func.max(WidgetMessage.created_at),
+        )
+        .filter(WidgetMessage.api_key_id == rec.id)
+        .group_by(WidgetMessage.session_id)
+        .order_by(func.max(WidgetMessage.created_at).desc())
+        .limit(60)
+        .all()
+    )
+    out = []
+    for sid, cnt, first, last in rows:
+        fu = (
+            db.query(WidgetMessage.content)
+            .filter(WidgetMessage.api_key_id == rec.id, WidgetMessage.session_id == sid, WidgetMessage.role == "user")
+            .order_by(WidgetMessage.created_at.asc())
+            .first()
+        )
+        out.append({
+            "session_id": sid,
+            "messages": cnt,
+            "started_at": first.isoformat() if first else None,
+            "last_at": last.isoformat() if last else None,
+            "preview": (fu[0] if fu else "")[:90],
+        })
+    return {"conversations": out}
+
+
+@router.get("/api-keys/{key_id}/conversations/{session_id}")
+def widget_transcript(
+    key_id: int,
+    session_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rec = _owned_key(key_id, user, db)
+    msgs = (
+        db.query(WidgetMessage)
+        .filter(WidgetMessage.api_key_id == rec.id, WidgetMessage.session_id == session_id)
+        .order_by(WidgetMessage.created_at.asc())
+        .all()
+    )
+    return {
+        "session_id": session_id,
+        "messages": [
+            {"role": m.role, "content": m.content, "at": m.created_at.isoformat() if m.created_at else None}
+            for m in msgs
+        ],
+    }
+
+
+@router.get("/api-keys/{key_id}/leads")
+def widget_leads(
+    key_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rec = _owned_key(key_id, user, db)
+    rows = (
+        db.query(WidgetLead)
+        .filter(WidgetLead.api_key_id == rec.id)
+        .order_by(WidgetLead.created_at.desc())
+        .limit(500)
+        .all()
+    )
+    return {
+        "leads": [
+            {"id": x.id, "name": x.name, "email": x.email, "message": x.message,
+             "at": x.created_at.isoformat() if x.created_at else None}
+            for x in rows
+        ]
+    }
 
 
 # ── KB info + documents (owner, JWT) ──────────────────────────────────────────
@@ -416,6 +636,25 @@ def _resolve_app(
 class RagChatRequest(BaseModel):
     question: str
     history: list = []
+    session_id: Optional[str] = None
+
+
+def _log_widget_turn(db: Session, key_id: int, session_id: str, question: str, answer: str, answered: bool) -> Optional[int]:
+    """Record a widget Q&A turn for the developer's analytics + transcripts.
+    Returns the assistant message id (so the widget can attach 👍/👎 feedback).
+    Best-effort: never let logging break the answer."""
+    try:
+        sid = (session_id or "anon")[:64]
+        db.add(WidgetMessage(api_key_id=key_id, session_id=sid, role="user", content=question[:4000]))
+        bot = WidgetMessage(api_key_id=key_id, session_id=sid, role="assistant",
+                            content=(answer or "")[:8000], answered=bool(answered))
+        db.add(bot)
+        db.commit()
+        db.refresh(bot)
+        return bot.id
+    except Exception:
+        db.rollback()
+        return None
 
 
 @router.post("/v1/rag/chat")
@@ -431,14 +670,64 @@ def rag_chat(
         raise HTTPException(status_code=400, detail="question is required.")
 
     result = ask_kb_question(_collection_name(app_key.id), question, req.history or [])
+    answer = result.get("answer", "")
+    sources = result.get("sources", [])
 
     app_key.usage_count = (app_key.usage_count or 0) + 1
     db.commit()
+    # No sources => the KB had nothing relevant (or no docs): a content gap.
+    message_id = _log_widget_turn(db, app_key.id, req.session_id or "anon", question, answer, answered=bool(sources))
 
     return {
-        "answer": result.get("answer", ""),
+        "answer": answer,
+        "message_id": message_id,
         "sources": [
             {"content": s.get("content", ""), "filename": (s.get("metadata") or {}).get("filename", "")}
-            for s in result.get("sources", [])
+            for s in sources
         ],
     }
+
+
+class WidgetFeedbackRequest(BaseModel):
+    message_id: int
+    value: int  # 1 = helpful, -1 = not helpful, 0 = clear
+
+
+@router.post("/v1/rag/feedback")
+def widget_feedback(
+    req: WidgetFeedbackRequest,
+    app_key: ApiKey = Depends(_resolve_app),
+    db: Session = Depends(get_db),
+):
+    """Record a visitor's 👍/👎 on a widget answer (public, widget token)."""
+    msg = db.get(WidgetMessage, req.message_id)
+    if msg is None or msg.api_key_id != app_key.id:
+        raise HTTPException(status_code=404, detail="Message not found.")
+    msg.feedback = 1 if req.value > 0 else (-1 if req.value < 0 else 0)
+    db.commit()
+    return {"ok": True}
+
+
+class WidgetLeadRequest(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    message: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@router.post("/v1/rag/lead")
+def submit_widget_lead(
+    req: WidgetLeadRequest,
+    app_key: ApiKey = Depends(_resolve_app),
+    db: Session = Depends(get_db),
+):
+    """Capture a visitor contact from the embedded widget (public, widget token)."""
+    name = (req.name or "").strip()[:120]
+    email = (req.email or "").strip()[:200]
+    message = (req.message or "").strip()[:1000]
+    if not (email or name):
+        raise HTTPException(status_code=400, detail="A name or email is required.")
+    db.add(WidgetLead(api_key_id=app_key.id, name=name or None, email=email or None,
+                      message=message or None, session_id=(req.session_id or None)))
+    db.commit()
+    return {"ok": True}
