@@ -251,6 +251,39 @@ class WidgetLead(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class PaymentGateway(Base):
+    """A payment method shown in the admin Payment Gateways menu and, when the
+    Fluxway PSP-orchestration backend is configured, bound to a remote
+    orchestrated PSP.
+
+    SECRETS ARE NOT STORED HERE. Credentials are forwarded to Fluxway, which
+    encrypts them; Close AI retains only the returned `psp_id` plus non-secret
+    config — this keeps the platform out of PCI scope. The Fluxway-binding
+    columns stay null until a gateway is linked to a remote PSP (Phase 2)."""
+
+    __tablename__ = "payment_gateways"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    logo = Column(Text, nullable=True)                       # URL or base64 data URL
+    deposit_enabled = Column(Boolean, default=True, nullable=False)
+    withdrawal_enabled = Column(Boolean, default=True, nullable=False)
+    active = Column(Boolean, default=True, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    # ── Fluxway PSP-orchestration binding (null until linked) ──
+    provider_code = Column(String, nullable=True)            # "stonepay", "praxis"…
+    psp_id = Column(String, nullable=True)                   # remote Fluxway psp_… id
+    brand_id = Column(String, nullable=True)                 # Fluxway X-BRAND-ID
+    environment_id = Column(String, nullable=True)           # Fluxway X-ENV-ID
+    flow_target_id = Column(String, nullable=True)
+    config = Column(Text, nullable=True)                     # JSON: currencies, routing (non-secret)
+    last_synced_at = Column(DateTime, nullable=True)
+    created_by = Column(String, nullable=True)               # admin email
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Plan(Base):
     """A subscription plan tier for developer apps (knowledge-base RAG).
 

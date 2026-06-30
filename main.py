@@ -31,6 +31,7 @@ from app.api.routes import features
 from app.api.routes import broadcast
 from app.api.routes import invite
 from app.api.routes import kb
+from app.api.routes import payments
 
 # Create database tables if they don't exist yet.
 Base.metadata.create_all(bind=engine)
@@ -194,6 +195,7 @@ app.include_router(features.router)    # /features — public read of platform f
 app.include_router(broadcast.router)   # /broadcast — public read of the active announcement
 app.include_router(invite.router)      # /invite/* — invite-link check + accept (onboarding)
 app.include_router(kb.router)          # /api-keys/{id}/kb + /v1/rag/chat + /plans — per-app RAG
+app.include_router(payments.router)    # /admin/payment-gateways/* — payment gateway config
 
 # Telegram bridge (optional): starts a polling thread when TELEGRAM_BOT_TOKEN is set.
 from app.services.telegram_bot import start_telegram_bridge  # noqa: E402

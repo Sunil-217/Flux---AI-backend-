@@ -23,6 +23,19 @@ HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 #    thread that answers Telegram messages via the RAG chat pipeline. ──
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# ── Fluxway PSP orchestration (optional) ──
+# When all three are set, the Payment Gateways admin can pull the live PSP
+# catalog from Fluxway and onboard a PSP at brand level (both Fluxway + Close AI).
+# Unset → the page works in local-only mode (manual add), no Fluxway calls.
+#   FLUXWAY_BASE_URL      e.g. http://localhost:7111/fluxway/v2
+#   FLUXWAY_SECRET_TOKEN  a brand environment secret (X-SECRET-TOKEN); bound to
+#                         one brand+environment, so onboarding lands brand-level.
+#   FLUXWAY_PSP_FLOW_TYPE the FlowType name whose targets are the PSP catalog.
+FLUXWAY_BASE_URL = (os.getenv("FLUXWAY_BASE_URL") or "").rstrip("/")
+FLUXWAY_SECRET_TOKEN = os.getenv("FLUXWAY_SECRET_TOKEN") or ""
+FLUXWAY_PSP_FLOW_TYPE = os.getenv("FLUXWAY_PSP_FLOW_TYPE") or "PSP"
+FLUXWAY_TIMEOUT = int(os.getenv("FLUXWAY_TIMEOUT", "20"))  # seconds
+
 # ── Auth ──
 _DEFAULT_JWT_SECRET = "dev-secret-change-me-in-production"
 JWT_SECRET = os.getenv("JWT_SECRET", _DEFAULT_JWT_SECRET)
