@@ -110,15 +110,14 @@ def test_filename_candidates_include_sanitized_upload_name():
     assert "Sunil_Gen_AI.pdf" in candidates
 
 
-def test_retrieve_relevant_retries_when_active_doc_filter_is_stale(fake_collection):
-    fake_collection.query.side_effect = [
-        {"documents": [[]], "metadatas": [[]], "embeddings": [[]]},
-        {
-            "documents": [["First chunk."]],
-            "metadatas": [[{"filename": "Sunil_Gen_AI.pdf"}]],
-            "embeddings": [[[0.1, 0.2, 0.3]]],
-        },
-    ]
+def test_retrieve_relevant_matches_upload_sanitized_filename(fake_collection):
+    """A display name with spaces still finds chunks stored under the
+    underscored upload name — via the filter's candidate list, in ONE query."""
+    fake_collection.query.return_value = {
+        "documents": [["First chunk."]],
+        "metadatas": [[{"filename": "Sunil_Gen_AI.pdf"}]],
+        "embeddings": [[[0.1, 0.2, 0.3]]],
+    }
 
     context, sources = rag_service._retrieve_relevant(
         fake_collection, "openings irukka da", ["Sunil Gen AI.pdf"]
@@ -126,9 +125,9 @@ def test_retrieve_relevant_retries_when_active_doc_filter_is_stale(fake_collecti
 
     assert context == "First chunk."
     assert len(sources) == 1
-    first_where = fake_collection.query.call_args_list[0].kwargs["where"]
-    assert "Sunil_Gen_AI.pdf" in first_where["filename"]["$in"]
-    assert "where" not in fake_collection.query.call_args_list[1].kwargs
+    assert fake_collection.query.call_count == 1
+    where = fake_collection.query.call_args_list[0].kwargs["where"]
+    assert "Sunil_Gen_AI.pdf" in where["filename"]["$in"]
 
 
 @pytest.mark.parametrize(
@@ -196,3 +195,239 @@ def test_stream_question_history_is_threaded(fake_llm, fake_collection):
     contents = [m["content"] for m in sent_messages]
     assert "my name is Kumar" in contents
     assert "what is my name" in contents
+
+
+# ── Strict document grounding ────────────────────────────────────────────────
+# A selected document is a scope boundary: when it cannot answer, the assistant
+# must say so rather than fall back on what the model happens to know.
+
+def _irrelevant_chunks(fake_collection):
+    """Chunks whose embeddings are orthogonal to the query vector, so cosine
+    similarity lands below _RAG_MIN_SIMILARITY."""
+    fake_collection.count.return_value = 4
+    fake_collection.query.return_value = {
+        "documents": [["Resume: worked on payment systems.", "Resume: studied at NIT."]],
+        "metadatas": [[{"filename": "Sunil_Gen_AI.pdf"}, {"filename": "Sunil_Gen_AI.pdf"}]],
+        # fake embed_query returns [0.1, 0.2, 0.3]; these are orthogonal to it.
+        "embeddings": [[[0.3, 0.0, -0.1], [-0.2, 0.1, 0.0]]],
+    }
+
+
+# A. Document selected + web OFF + question answerable from the PDF.
+def test_doc_mode_answers_from_document(fake_llm, fake_collection):
+    fake_collection.count.return_value = 4
+    fake_llm["stream_tokens"] = ["Payment ", "systems."]
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "what did they work on", [], web_search=False, active_docs=["a.pdf"]
+        )
+    )
+    assert [e["type"] for e in events if e["type"] == "token"] == ["token", "token"]
+    assert any(e["type"] == "sources" for e in events)
+    assert events[-1]["type"] == "done"
+
+
+# B. Document selected + web OFF + question NOT in the PDF → refuse, no LLM call.
+def test_doc_mode_refuses_when_nothing_relevant(fake_llm, fake_collection):
+    _irrelevant_chunks(fake_collection)
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "who is cm of tamil nadu", [], web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+        )
+    )
+    tokens = [e["content"] for e in events if e["type"] == "token"]
+    assert tokens == [rag_service.DOC_NOT_FOUND_MESSAGE]
+    assert events[-1]["type"] == "done"
+    # No source chips for a question the document cannot answer.
+    assert not any(e["type"] == "sources" for e in events)
+    # The guard must run BEFORE the model — no streaming call at all.
+    assert not [c for c in fake_llm["calls"] if c.get("stream")]
+
+
+# C. Document selected + web ON + question not in the PDF → web path still allowed.
+def test_doc_mode_with_web_on_still_reaches_the_model(fake_llm, fake_collection, monkeypatch):
+    _irrelevant_chunks(fake_collection)
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    monkeypatch.setattr(rag_service, "run_web_search", lambda q: "M.K. Stalin is the CM.")
+    fake_llm["router"] = "current chief minister of Tamil Nadu"
+    fake_llm["stream_tokens"] = ["M.K. ", "Stalin."]
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "who is cm of tamil nadu", [], web_search=True, active_docs=["Sunil_Gen_AI.pdf"]
+        )
+    )
+    tokens = [e["content"] for e in events if e["type"] == "token"]
+    assert "".join(tokens) == "M.K. Stalin."
+    assert [c for c in fake_llm["calls"] if c.get("stream")]
+
+
+# D. No document + web OFF → ordinary chat, not RAG.
+def test_no_document_web_off_is_normal_chat(fake_llm, fake_collection):
+    fake_collection.count.return_value = 0
+    fake_llm["stream_tokens"] = ["Hello ", "there."]
+    events = _parse(rag_service.stream_question("c1", "hello", [], web_search=False))
+    assert "".join(e["content"] for e in events if e["type"] == "token") == "Hello there."
+    stream_calls = [c for c in fake_llm["calls"] if c.get("stream")]
+    assert stream_calls
+    assert "Document Context" not in stream_calls[-1]["messages"][0]["content"]
+
+
+# E. Document A selected → document B is never retrieved.
+def test_selected_document_filter_is_not_widened(fake_collection):
+    """A filter miss stays a miss: no second, unfiltered query."""
+    fake_collection.count.return_value = 4
+    fake_collection.query.return_value = {"documents": [[]], "metadatas": [[]], "embeddings": [[]]}
+
+    context, sources = rag_service._retrieve_relevant(fake_collection, "anything", ["a.pdf"])
+
+    assert context == ""
+    assert sources == []
+    assert fake_collection.query.call_count == 1
+    assert fake_collection.query.call_args_list[0].kwargs["where"] is not None
+
+
+def test_query_collection_does_not_retry_unfiltered_on_error(fake_collection):
+    fake_collection.query.side_effect = RuntimeError("chroma is unhappy")
+    results = rag_service._query_collection(fake_collection, [0.1, 0.2, 0.3], 4, {"filename": {"$in": ["a.pdf"]}})
+    assert results["documents"] == [[]]
+    assert fake_collection.query.call_count == 1
+
+
+# F. A new question is answered fresh, never replayed from history.
+def test_new_question_is_not_served_from_history(fake_llm, fake_collection):
+    _irrelevant_chunks(fake_collection)
+    history = [
+        {"role": "user", "content": "who is cm of tamil nadu"},
+        {"role": "assistant", "content": "M.K. Stalin is the current chief minister."},
+    ]
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "who is cm of kerala", history, web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+        )
+    )
+    tokens = [e["content"] for e in events if e["type"] == "token"]
+    assert tokens == [rag_service.DOC_NOT_FOUND_MESSAGE]
+    # A prior assistant answer in history must not leak through as the reply.
+    assert "Stalin" not in "".join(tokens)
+
+
+# Web access off must never reach the search provider.
+def test_web_search_off_never_calls_the_search_provider(fake_llm, fake_collection, monkeypatch):
+    fake_collection.count.return_value = 0
+    calls = []
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    monkeypatch.setattr(rag_service, "run_web_search", lambda q: calls.append(q) or "results")
+    list(rag_service.stream_question("c1", "what is the bitcoin price today", [], web_search=False))
+    assert calls == []
+
+
+# The prompt itself must forbid pretrained-knowledge answers.
+def test_rag_prompt_forbids_general_knowledge():
+    assert "ONLY the supplied document context" in rag_service.SYSTEM_RAG
+    assert rag_service.DOC_NOT_FOUND_MESSAGE in rag_service.SYSTEM_RAG
+    assert "using your own knowledge" not in rag_service.SYSTEM_RAG
+
+
+# ── Conversational exception inside document mode ────────────────────────────
+# Small talk stays conversational; anything that asks for a fact does not.
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "hi", "hello", "Hey!", "hiya",
+        "thanks", "Thanks!", "thank you", "thank you very much", "thx",
+        "ok", "ok cool", "got it", "noted",
+        "good morning", "good night",
+        "bye", "see you later",
+        "vanakkam", "nandri da",
+    ],
+)
+def test_is_conversational_accepts_small_talk(message):
+    assert rag_service._is_conversational(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # The whole point: a factual question must never take the bypass.
+        "who is CM of Tamil Nadu?",
+        "what is Python?",
+        "what is the capital of France",
+        # Greeting glued to a real question must not sneak through.
+        "hi, who is the CM?",
+        "thanks, now what is python",
+        "good morning what is the revenue",
+        # Document questions stay in document mode.
+        "what does the document say",
+        "summarize this",
+        "python",
+        "",
+    ],
+)
+def test_is_conversational_rejects_questions(message):
+    assert rag_service._is_conversational(message) is False
+
+
+def test_greeting_in_document_mode_gets_a_normal_reply(fake_llm, fake_collection):
+    """A document is open, web is off — "hi" must not be refused."""
+    _irrelevant_chunks(fake_collection)
+    fake_llm["stream_tokens"] = ["Hello! ", "How can I help?"]
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "hi", [], web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+        )
+    )
+    reply = "".join(e["content"] for e in events if e["type"] == "token")
+    assert reply == "Hello! How can I help?"
+    assert rag_service.DOC_NOT_FOUND_MESSAGE not in reply
+    # Answered as ordinary chat, so no document context was pasted in.
+    stream_calls = [c for c in fake_llm["calls"] if c.get("stream")]
+    assert "Document Context" not in stream_calls[-1]["messages"][0]["content"]
+
+
+def test_thanks_in_document_mode_gets_a_normal_reply(fake_llm, fake_collection):
+    _irrelevant_chunks(fake_collection)
+    fake_llm["stream_tokens"] = ["You're ", "welcome!"]
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "thanks", [], web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+        )
+    )
+    reply = "".join(e["content"] for e in events if e["type"] == "token")
+    assert reply == "You're welcome!"
+    assert rag_service.DOC_NOT_FOUND_MESSAGE not in reply
+
+
+def test_conversational_bypass_does_not_leak_factual_questions(fake_llm, fake_collection):
+    """The exception must be narrow: a fact question still gets refused, and
+    the model is never asked."""
+    _irrelevant_chunks(fake_collection)
+    for question in ("who is CM of Tamil Nadu?", "what is Python?", "hi, who is the CM?"):
+        fake_llm["calls"].clear()
+        events = _parse(
+            rag_service.stream_question(
+                "c1", question, [], web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+            )
+        )
+        tokens = [e["content"] for e in events if e["type"] == "token"]
+        assert tokens == [rag_service.DOC_NOT_FOUND_MESSAGE], question
+        assert not [c for c in fake_llm["calls"] if c.get("stream")], question
+
+
+# ── Threshold calibration anchors ────────────────────────────────────────────
+# Real similarity scores measured against jina-embeddings-v3 and a real PDF.
+# These pin the decision so a future threshold change has to confront the data.
+
+def test_threshold_keeps_the_measured_relevant_range():
+    """The weakest genuinely-relevant query measured 0.213; it must survive."""
+    assert rag_service._RAG_MIN_SIMILARITY < 0.213
+
+
+def test_threshold_rejects_the_reported_bug_case():
+    """"who is cm of tamil nadu" scored 0.085 against the test document."""
+    assert rag_service._RAG_MIN_SIMILARITY > 0.085
+
+
+def test_threshold_rejects_the_measured_unrelated_bulk():
+    """12 of 13 unrelated queries scored <= 0.145."""
+    assert rag_service._RAG_MIN_SIMILARITY > 0.145

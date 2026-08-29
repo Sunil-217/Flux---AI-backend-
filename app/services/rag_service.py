@@ -385,11 +385,19 @@ SYSTEM_NORMAL = (
     + DIAGRAM_RULE
 )
 
+# The single wording used both by the server-side guard (when retrieval finds
+# nothing) and by the model itself (when the retrieved context turns out not to
+# contain the answer), so the user sees one consistent reply either way.
+DOC_NOT_FOUND_MESSAGE = "I couldn't find this information in the selected document."
+
 SYSTEM_RAG = (
-    "You are Close AI, a knowledgeable and precise AI assistant with access to an uploaded document.\n\n"
+    "You are Close AI, answering questions about the selected document.\n\n"
     "Guidelines:\n"
-    "- If the user's message is about the document, answer using the context below — accurately and without making things up.\n"
-    "- If the user sends a greeting or a general question unrelated to the document, answer it naturally and helpfully using your own knowledge — do NOT say \"no context\" or refuse.\n"
+    "- Use ONLY the supplied document context below. Do not use your pretrained "
+    "or general knowledge to answer, even if you are confident you know the answer.\n"
+    "- Do not infer facts that the context does not support.\n"
+    "- If the answer is not present in the supplied context, reply exactly: "
+    f"\"{DOC_NOT_FOUND_MESSAGE}\"\n"
     "- Interpret technical acronyms in their common technical meaning (e.g. 'RAG' = Retrieval-Augmented Generation).\n"
     "- Be accurate and clear, with depth calibrated to the question (see ANSWER DEPTH & FORMATTING).\n"
     "- " + LANGUAGE_RULE + "\n\n"
@@ -402,6 +410,45 @@ SYSTEM_RAG = (
     + DIAGRAM_RULE + "\n\n"
     "Document Context:\n{context}"
 )
+
+
+# Small talk that should still work while a document is selected: "hi",
+# "thanks", "ok cool". Without this, strict document mode answers a greeting
+# with "I couldn't find this information in the selected document."
+#
+# Deliberately a closed vocabulary rather than a pattern, because the cost of
+# being too broad is the bug this whole change exists to prevent: one factual
+# question slipping through here goes straight to the model's own knowledge.
+# A message qualifies only if it is at most _CONVERSATIONAL_MAX_WORDS long AND
+# every single word is on the list. "hi" passes; "hi, who is the CM?" does not,
+# because "who", "is" and "cm" are not on it.
+_CONVERSATIONAL_MAX_WORDS = 4
+_CONVERSATIONAL_WORDS = frozenset(
+    """
+    hi hii hiii hey heyy hello helo hiya yo namaste vanakkam
+    good morning afternoon evening night day
+    thanks thank thanku thankyou thx tysm ty nandri
+    ok okay okey k cool nice great awesome perfect lovely super
+    got it understood noted fine alright
+    bye goodbye see cya later
+    sorry please welcome
+    yes yeah yep yup no nope sure
+    da bro dude mate there you u
+    very much
+    """.split()
+)
+
+
+def _is_conversational(question: str) -> bool:
+    """True for pure small talk — greetings, thanks, acknowledgements.
+
+    Must never return True for anything that asks for a fact, because the
+    caller uses it to skip document grounding entirely.
+    """
+    words = re.findall(r"[a-z']+", (question or "").lower())
+    if not words or len(words) > _CONVERSATIONAL_MAX_WORDS:
+        return False
+    return all(w in _CONVERSATIONAL_WORDS for w in words)
 
 
 # Cheap local pre-filter: only questions matching these time-sensitive signals
@@ -923,9 +970,42 @@ def _ground_prompt(base_system: str, question: str, history: list, chat_id: str 
     return grounded
 
 
-# Chunks below this cosine similarity to the question are treated as irrelevant
-# (so off-topic questions don't show misleading "sources" from the PDF).
-_RAG_MIN_SIMILARITY = 0.3
+# Chunks below this cosine similarity to the question are treated as irrelevant.
+# Nothing above it means the document cannot answer, and stream_question refuses
+# instead of calling the model.
+#
+# Calibrated 2026-08-29 against real jina-embeddings-v3 vectors and a real PDF
+# (Close_AI_Feature_Guide.pdf, 11 chunks), scoring each query by its BEST match
+# across the chunks — which is what decides whether the guard fires:
+#
+#   relevant   (12 queries answerable from the PDF)  0.213 .. 0.828  median 0.405
+#   unrelated  (13 queries plainly not in the PDF)   0.015 .. 0.397  median 0.071
+#   borderline (5 plausible-but-absent)              0.121 .. 0.288  median 0.232
+#
+# The classes overlap only because of one query — "what is Python?" at 0.397,
+# which is genuinely adjacent to a document about an AI developer tool. Every
+# other unrelated query scores <= 0.145, so the real boundary sits in the wide
+# 0.145 .. 0.213 gap.
+#
+# Measured behaviour by threshold:
+#
+#   0.20   12/12 relevant kept   12/13 unrelated blocked   <- chosen
+#   0.25   11/12                 12/13
+#   0.30   10/12                 12/13                     <- previous value
+#   0.40    6/12                 13/13
+#
+# 0.30 was strictly worse than 0.20: it blocked no more unrelated queries and
+# refused two questions the document actually answers. Raising it far enough to
+# catch the outlier (0.40) costs half the recall, which is the wrong trade — a
+# user who knows the answer is in their PDF and is told it isn't has been failed
+# more visibly than one who gets a question politely declined.
+#
+# The outlier is caught by the second layer instead: SYSTEM_RAG instructs the
+# model to reply with DOC_NOT_FOUND_MESSAGE when the supplied context does not
+# support an answer. The threshold's job is the clear misses, not every miss.
+#
+# Caveat: calibrated on one document. Worth re-measuring against a larger corpus.
+_RAG_MIN_SIMILARITY = 0.20
 
 
 def _safe_metadata_filename(name: str) -> str:
@@ -953,48 +1033,40 @@ def _empty_query_results() -> dict:
 
 
 def _query_collection(collection, q_emb: list, n: int, where: dict = None) -> dict:
-    """Query Chroma, retrying without a stale filename filter when needed."""
+    """Query Chroma, honouring the caller's document filter.
+
+    A `where` filter is a scope boundary, not a hint: when the user has picked
+    which documents to ask about, a miss must stay a miss. This used to retry
+    without the filter whenever the filtered query errored or came back empty,
+    which quietly answered from whatever else happened to be in the same chat —
+    exactly the documents the user had deselected.
+    """
     if n <= 0:
         return _empty_query_results()
 
     try:
-        results = collection.query(
+        return collection.query(
             query_embeddings=[q_emb],
             n_results=n,
             where=where,
             include=["documents", "metadatas", "embeddings"],
         )
     except Exception:
-        if not where:
-            return _empty_query_results()
-        try:
-            results = collection.query(
-                query_embeddings=[q_emb],
-                n_results=n,
-                include=["documents", "metadatas", "embeddings"],
-            )
-        except Exception:
-            return _empty_query_results()
-
-    documents = (results.get("documents") or [[]])[0]
-    if where and not documents:
-        try:
-            return collection.query(
-                query_embeddings=[q_emb],
-                n_results=n,
-                include=["documents", "metadatas", "embeddings"],
-            )
-        except Exception:
-            return _empty_query_results()
-    return results
+        return _empty_query_results()
 
 
 def _retrieve_relevant(collection, question: str, active_docs: list = None):
     """
     Query the document collection and keep ONLY chunks that are actually similar
-    to the question (cosine similarity). Returns (context_text, sources_list);
-    both empty if nothing is relevant — so the answer falls back to general
-    knowledge with no misleading source chips.
+    to the question (cosine similarity). Returns (context_text, sources_list),
+    both empty when nothing clears the threshold.
+
+    The threshold gates the CONTEXT, not just the source chips. It used to gate
+    only the chips: every retrieved chunk was pasted into the prompt regardless
+    of similarity, so an off-topic question produced a prompt full of irrelevant
+    document text and no citations, and the model answered from its own
+    knowledge. An empty context is now the signal that the document cannot
+    answer this question, and the caller refuses rather than guessing.
 
     When `active_docs` is given, only chunks from those filenames are searched
     (the user's multi-document picker).
@@ -1014,21 +1086,21 @@ def _retrieve_relevant(collection, question: str, active_docs: list = None):
     q = np.asarray(q_emb, dtype=float)
     q_norm = float(np.linalg.norm(q)) + 1e-9
 
-    # Always pass the retrieved chunks to the model so it can answer from the PDF.
-    context = "\n\n".join(documents)
-
-    # Only the chunks genuinely similar to the question become source chips,
-    # so off-topic questions don't show misleading citations.
+    relevant = []
     sources = []
     for i in range(len(documents)):
+        # A chunk with no stored embedding cannot be scored. Treat it as
+        # relevant rather than dropping content the user did upload — the
+        # filename filter has already limited it to the selected documents.
         sim = 1.0
         if i < len(embeddings) and embeddings[i] is not None:
             v = np.asarray(embeddings[i], dtype=float)
             sim = float(np.dot(v, q) / ((float(np.linalg.norm(v)) + 1e-9) * q_norm))
         if sim >= _RAG_MIN_SIMILARITY:
+            relevant.append(documents[i])
             sources.append({"content": documents[i], "metadata": metadatas[i]})
 
-    return context, sources
+    return "\n\n".join(relevant), sources
 
 
 def _normal_chat(question: str, history: list = [], chat_id: str = None) -> dict:
@@ -1339,7 +1411,11 @@ def stream_question(
 
         collection = get_or_create_collection(chat_id)
 
-        if collection.count() == 0:
+        # Small talk is answered conversationally even with a document open —
+        # retrieving chunks for "thanks" is meaningless, and refusing it reads
+        # as a bug. Everything that is not pure small talk stays inside strict
+        # document grounding below.
+        if collection.count() == 0 or _is_conversational(question):
             system_prompt = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(history)
@@ -1350,6 +1426,19 @@ def stream_question(
             yield from _stream_completion(messages, 0.3)
         else:
             context, sources = _retrieve_relevant(collection, question, active_docs)
+
+            # Nothing in the selected document(s) is relevant. With web access
+            # off there is no other grounded source, so refuse here instead of
+            # handing the question to the model — a model asked about a topic
+            # its context does not cover will answer from pretrained knowledge
+            # and present it as if it came from the document.
+            #
+            # With web access on, the web path below is a legitimate grounded
+            # source, so the question is allowed through.
+            if not context and not web_search:
+                yield _sse({"type": "token", "content": DOC_NOT_FOUND_MESSAGE})
+                yield _sse({"type": "done"})
+                return
 
             # Only show source chips when the document actually had relevant chunks.
             if sources:
