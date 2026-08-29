@@ -39,8 +39,8 @@ router = APIRouter()
 
 # Model aliases exposed to developers → (upstream model id, which client).
 MODEL_ALIASES = {
-    "close-chat": (MODEL, "groq"),        # fast general chat (llama-3.3-70b on Groq)
-    "close-code": (CODE_MODEL, "nvidia"),  # strongest free coder (qwen3-coder-480b)
+    "close-chat": (MODEL, "groq"),       # fast general chat
+    "close-code": (CODE_MODEL, "groq"),  # code generation / review
 }
 DEFAULT_ALIAS = "close-chat"
 

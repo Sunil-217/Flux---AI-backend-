@@ -77,7 +77,7 @@ def test_stream_question_falls_back_when_first_provider_cannot_start(
     assert events[-1]["type"] == "done"
     stream_calls = [c for c in fake_llm["calls"] if c.get("stream")]
     assert len(stream_calls) == 2
-    assert stream_calls[-1]["model"] == rag_service.NVIDIA_CHAT_MODEL
+    assert stream_calls[-1]["model"] == rag_service.FALLBACK_CHAT_MODEL
 
 
 def test_stream_question_rag_emits_sources_first(fake_llm, fake_collection):
