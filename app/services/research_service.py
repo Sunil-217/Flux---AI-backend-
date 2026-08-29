@@ -13,7 +13,7 @@ the route never 500s on upstream flakiness.
 import json
 import re
 
-from app.services.rag_service import _groq_or_nvidia, MODEL
+from app.services.rag_service import _groq_or_nvidia, MODEL, ROUTER_MODEL
 from app.services.web_search_service import (
     web_search as run_web_search,
     is_search_available,
@@ -48,7 +48,9 @@ def _generate_queries(question: str) -> list:
     """Ask the LLM for 3-4 diverse search queries. Falls back to the question."""
     try:
         resp = _groq_or_nvidia().chat.completions.create(
-            model=MODEL,
+            # A short JSON list, not prose — see the ROUTER_MODEL note in
+            # rag_service on why reasoning models are wrong for small budgets.
+            model=ROUTER_MODEL,
             messages=[
                 {"role": "system", "content": _QUERY_SYSTEM},
                 {"role": "user", "content": (question or "")[:1000]},
