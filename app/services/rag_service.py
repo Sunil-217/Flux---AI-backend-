@@ -115,7 +115,7 @@ ROUTER_SYSTEM = (
 )
 
 # Reply-language rule shared by both modes.
-LANGUAGE_RULE = (
+LANGUAGE_CORE = (
     "LANGUAGE — MATCH THE USER'S SCRIPT EXACTLY. THIS RULE OVERRIDES EVERYTHING ELSE:\n"
     "STEP 1 — look at the ALPHABET (script) of the user's LATEST message, before anything else:\n"
     "  • LATIN / ENGLISH alphabet (a-z), INCLUDING romanized Indian languages — Tanglish, "
@@ -135,6 +135,15 @@ LANGUAGE_RULE = (
     "OVERRIDE: If the user explicitly asks for 'Tanglish' / 'Hinglish' / 'English letters' / "
     "'romanized' / 'tanglish la' — ALWAYS use the LATIN alphabet, no matter what. Only reply in "
     "pure English if the user wrote in pure English or explicitly asked for English.\n\n"
+    "AMBIGUITY: If the request is genuinely unclear (which API, which language, etc.), make a "
+    "sensible assumption from the conversation and give a useful answer with a short example, "
+    "rather than only asking for clarification."
+)
+
+# The romanised-Indic glossary. ~500 tokens of particle definitions that only
+# earn their place when the user is actually writing that way — attached by
+# _system_prompt_for, not paid for on every English message.
+REGIONAL_GLOSSARY = (
     "UNDERSTANDING CASUAL TANGLISH: Tamil filler/casual particles are informal tone, NOT something "
     "to question. Common ones: 'da'/'machan'/'machi' (casual 'bro'), 'tha'/'dhaan' (emphasis: "
     "just/itself), 'kudu'/'kodu'/'tha'/'venum'/'venaa' (give / I want / need), 'ha'/'aa' (makes it a "
@@ -161,10 +170,10 @@ LANGUAGE_RULE = (
     "'kahaan' (where), 'matlab' (means), 'thoda' (a little), 'bahut'/'bohot' (very), 'kar' "
     "(do), 'hai' (is), 'nahi' (no), 'haan' (yes), 'yaar'/'bhai' (bro). Reply in the same "
     "Hinglish style if the user does.\n\n"
-    "AMBIGUITY: If the request is genuinely unclear (which API, which language, etc.), make a "
-    "sensible assumption from the conversation and give a useful answer with a short example, "
-    "rather than only asking for clarification."
 )
+
+# Complete language ruleset, for callers with no question to inspect.
+LANGUAGE_RULE = "\n\n".join([LANGUAGE_CORE, REGIONAL_GLOSSARY])
 
 # Short, forceful recency reminder appended to the VERY END of every system
 # prompt (after the long rules + web context). llama models "lose" instructions
@@ -345,7 +354,9 @@ def _style_suffix(style: str = None, custom_instructions: str = None) -> str:
     return ("\n\n" + "\n\n".join(parts)) if parts else ""
 
 
-SYSTEM_NORMAL = (
+# The always-on core: identity, app capabilities, and the ambiguity policy.
+# The situational rule blocks are attached per question by _system_prompt_for.
+SYSTEM_BASE = (
     "You are Close AI, a knowledgeable and precise AI assistant. "
     "You are an expert across technology, programming, AI/ML, science, and general knowledge. "
     "When a user mentions a technical term or acronym (such as 'RAG', 'LLM', 'API', 'GAN'), "
@@ -367,23 +378,123 @@ SYSTEM_NORMAL = (
     "If a user wants a styled PDF document, report, resume, or brief, suggest "
     "`/pdf <topic>` instead of just writing Markdown in chat.\n"
     "- Do NOT mention `/video` — that path requires paid credits and is currently "
-    "hidden in this build.\n\n"
-    + LANGUAGE_RULE
-    + "\n\n"
-    + INSTRUCTION_FOLLOWING_RULE
-    + "\n\n"
-    + ACCURACY_RULE
-    + "\n\n"
-    + TEMPORAL_RULE
-    + "\n\n"
-    + CODE_RULE
-    + "\n\n"
-    + MATH_RULE
-    + "\n\n"
-    + FORMAT_DEPTH_RULE
-    + "\n\n"
-    + DIAGRAM_RULE
+    "hidden in this build."
 )
+
+# Every rule block, unconditionally. Kept as the complete ruleset for callers
+# that have no question to inspect, and as the reference the per-question
+# assembly is a subset of.
+SYSTEM_NORMAL = "\n\n".join(
+    [
+        SYSTEM_BASE,
+        LANGUAGE_RULE,
+        INSTRUCTION_FOLLOWING_RULE,
+        ACCURACY_RULE,
+        TEMPORAL_RULE,
+        CODE_RULE,
+        MATH_RULE,
+        FORMAT_DEPTH_RULE,
+        DIAGRAM_RULE,
+    ]
+)
+
+# ── Sending only the rules a question actually needs ─────────────────────────
+# SYSTEM_NORMAL is ~3,200 tokens and used to be sent whole on every message.
+# The Groq free tier allows 8,000 tokens per MINUTE, so the fixed prompt alone
+# claimed roughly 40% of the per-minute budget before the user had typed a word.
+# Two or three messages exhausted it and the rest queued: measured time to first
+# token climbed 1.7s -> 15s -> 26s -> 28s -> 32s over five consecutive questions,
+# which is what made the app feel slow next to ChatGPT.
+#
+# Four of the rule blocks only matter for particular questions. A greeting needs
+# no mermaid syntax guide, and "what is 2+2" needs no web-freshness policy. They
+# are attached only when the question calls for them.
+#
+# Everything else — language mirroring, accuracy, instruction following, answer
+# depth and formatting — applies to every reply and stays unconditional. Answer
+# QUALITY was measured as good before this change; the point is to keep it while
+# spending fewer tokens getting there.
+
+_DIAGRAM_HINT = re.compile(
+    r"\b(diagram|flow ?chart|flow diagram|architecture|sequence diagram|mind ?map|"
+    r"er diagram|uml|state machine|workflow|pipeline|visuali[sz]e|draw the flow|mermaid)\b",
+    re.I,
+)
+_CODE_HINT = re.compile(
+    r"\b(code|function|class|method|api|endpoint|script|program|bug|debug|error|exception|"
+    r"compile|syntax|library|framework|import|regex|sql|query|algorithm|refactor|"
+    r"python|javascript|typescript|java|c\+\+|rust|go|php|html|css|react|node|django|fastapi)\b",
+    re.I,
+)
+# Particles that only appear when someone is writing an Indian language in Latin
+# letters. Drawn from the glossary itself, so anything the glossary explains is
+# also something that switches the glossary on.
+_ROMANISED_INDIC_HINT = re.compile(
+    r"\b("
+    # Tamil
+    r"da|da+|machan|machi|dhaan|thaan|venum|venaa|venam|kudu|kodu|pannu|panni|pannu?nga|"
+    r"sollu|solunga|kaattu|kaatu|kaami|eppadi|epdi|yappdi|enna|yenna|yaaru|edhukku|yethuku|"
+    r"irukku|irukkanum|aaganum|aagala|aagalla|mudiyum|podu|illa|romba|konjam|kuda|kooda|"
+    r"kulla|ulla|innum|maari|maathiri|ellam|yalla|apparam|aprm|seri|vaikka|naan|neenga|"
+    r"ippo|adhu|idhu|edhu|nalla|paaru|paakka|theriyuma|vera|onnu|rendu|"
+    # Hindi
+    r"kya|kaise|kahaan|matlab|thoda|bahut|bohot|nahi|haan|yaar|bhai|mujhe|chahiye|"
+    r"banao|dikhao|batao|karo|hai|hain|kaam|acha|theek|"
+    # Telugu
+    r"enti|emiti|ela|enduku|evaru|cheppu|chupinchu|kavali|cheyyi|naaku|oka|bagundi"
+    r")\b",
+    re.I,
+)
+
+_MATH_HINT = re.compile(
+    r"(\d\s*[+\-*/^×÷]\s*\d|\b(calculate|compute|solve|equation|formula|derivative|integral|"
+    r"matrix|probability|percentage|algebra|geometry|arithmetic|sum of|average of)\b)",
+    re.I,
+)
+
+
+def _looks_romanised_indic(text: str) -> bool:
+    """True when the user is writing Tamil/Hindi/Telugu in Latin letters.
+
+    Kept deliberately trigger-happy. The cost of a false positive is ~570 tokens
+    of glossary; the cost of a false negative is the model treating "epdi pannradhu"
+    as gibberish, which is the exact experience the glossary exists to prevent.
+    A single particle anywhere in the message is enough.
+    """
+    return bool(_ROMANISED_INDIC_HINT.search(text or ""))
+
+
+def _system_prompt_for(question: str, history: list = None) -> str:
+    """Assemble the chat system prompt, including only the situational rules.
+
+    When in doubt the block is included: a slightly larger prompt costs latency,
+    a missing rule costs a wrong answer.
+    """
+    parts = [SYSTEM_BASE, LANGUAGE_CORE]
+
+    q = question or ""
+    # Also scan recent turns: someone who opened in Tanglish and follows up with
+    # a bare "yes" is still in a Tanglish conversation.
+    recent = " ".join(str(m.get("content", ""))[:400] for m in (history or [])[-4:])
+    if _looks_romanised_indic(q) or _looks_romanised_indic(recent):
+        parts.append(REGIONAL_GLOSSARY)
+
+    parts += [INSTRUCTION_FOLLOWING_RULE, ACCURACY_RULE]
+
+    if _might_need_fresh_info(q):
+        parts.append(TEMPORAL_RULE)
+    if _CODE_HINT.search(q):
+        parts.append(CODE_RULE)
+    if _MATH_HINT.search(q):
+        parts.append(MATH_RULE)
+
+    parts.append(FORMAT_DEPTH_RULE)
+
+    if _DIAGRAM_HINT.search(q):
+        parts.append(DIAGRAM_RULE)
+
+    return "\n\n".join(parts)
+
 
 # The single wording used both by the server-side guard (when retrieval finds
 # nothing) and by the model itself (when the retrieved context turns out not to
@@ -1114,7 +1225,7 @@ def _retrieve_relevant(collection, question: str, active_docs: list = None):
 def _normal_chat(question: str, history: list = [], chat_id: str = None) -> dict:
     """No PDF uploaded — behave as a general AI assistant."""
 
-    system_prompt = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id)
+    system_prompt = _ground_prompt(_system_prompt_for(question, history), question, history, chat_id)
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
@@ -1441,7 +1552,7 @@ def stream_question(
         # as a bug. Everything that is not pure small talk stays inside strict
         # document grounding below.
         if not has_documents or _is_conversational(question):
-            system_prompt = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
+            system_prompt = _ground_prompt(_system_prompt_for(question, history), question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(history)
             messages.append({"role": "user", "content": question})
