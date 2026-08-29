@@ -1,26 +1,42 @@
 """Text chunking + embeddings.
 
-Embeddings are computed via NVIDIA's cloud embedding API (NOT a local model),
-so the backend stays lightweight — critical on low-RAM machines (no PyTorch /
-sentence-transformers load). Model: nvidia/nv-embedqa-e5-v5 (1024-dim), using
-input_type 'passage' for documents and 'query' for the user's question.
+Embeddings come from a cloud API, NOT a local model, so the backend stays
+lightweight — critical on a small instance. (Measured 2026-08-29: the lightest
+usable local multilingual ONNX model still costs ~500 MB of RSS, which does not
+fit alongside the app.) Nothing heavy loads at import.
+
+Provider is chosen by which key is set:
+
+  JINA_API_KEY   → jina-embeddings-v3     (1024-dim, ~89 languages, free tier)
+  NVIDIA_API_KEY → nvidia/nv-embedqa-*    (1024-dim, legacy)
+
+Both are 1024-dim, so switching between them does not change the vector width —
+but the vectors are NOT interchangeable. Documents indexed with one provider
+must be re-indexed before they can be searched with the other.
 
 Chunking is a small dependency-free splitter (NO langchain_text_splitters, which
 transitively imports transformers → torch and was OOM-ing the backend on a
-3.75 GB machine). Everything here is API-based; nothing heavy loads at import.
+3.75 GB machine).
 """
 
 from openai import OpenAI
 
-from app.core.config import NVIDIA_API_KEY
+from app.core.config import JINA_API_KEY, NVIDIA_API_KEY
 
-_client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=NVIDIA_API_KEY,
-    timeout=60,
-)
+# Jina's embeddings endpoint is OpenAI-compatible, so the same SDK serves both.
+if JINA_API_KEY:
+    EMBED_PROVIDER = "jina"
+    EMBED_MODEL = "jina-embeddings-v3"
+    _client = OpenAI(base_url="https://api.jina.ai/v1", api_key=JINA_API_KEY, timeout=60)
+else:
+    EMBED_PROVIDER = "nvidia"
+    EMBED_MODEL = "nvidia/nv-embedqa-mistral-7b-v2"
+    _client = OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=NVIDIA_API_KEY,
+        timeout=60,
+    )
 
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
 EMBED_DIM = 1024
 _BATCH = 50  # keep request sizes well within the API's per-call input limit
 
@@ -59,6 +75,18 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150):
     return chunks
 
 
+# Both providers want to know whether a string is a stored document or a live
+# question — asymmetric embedding measurably improves retrieval — but they spell
+# it differently.
+_JINA_TASK = {"passage": "retrieval.passage", "query": "retrieval.query"}
+
+
+def _extra_body(input_type: str) -> dict:
+    if EMBED_PROVIDER == "jina":
+        return {"task": _JINA_TASK[input_type], "truncate": True}
+    return {"input_type": input_type, "truncate": "END"}
+
+
 def _embed(inputs, input_type: str):
     """Embed a list of strings in batches. input_type is 'passage' or 'query'."""
     vectors = []
@@ -67,7 +95,7 @@ def _embed(inputs, input_type: str):
         resp = _client.embeddings.create(
             model=EMBED_MODEL,
             input=batch,
-            extra_body={"input_type": input_type, "truncate": "END"},
+            extra_body=_extra_body(input_type),
         )
         vectors.extend(item.embedding for item in resp.data)
     return vectors

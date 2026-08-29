@@ -11,6 +11,7 @@ IS_PRODUCTION = APP_ENV == "production"
 
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY")   # Chat / Router / Plan (faster inference)
+JINA_API_KEY   = os.getenv("JINA_API_KEY")   # Embeddings (RAG). See embedding_service.
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # Pollinations.ai (kept as a fallback option for /generate/video).
 POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")

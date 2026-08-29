@@ -47,19 +47,33 @@ def _groq_or_nvidia():
     """Return the Groq client when available, otherwise the NVIDIA client."""
     return groq_client if groq_client is not None else client
 
-# ── Model routing (verified via benchmark 2026-06-08) ──
-# CHAT / RAG answers   → Groq  llama-3.3-70b-versatile  (~1.9s, 3-5x faster)
-# Router (web search?) → Groq  llama-3.3-70b-versatile  (~1.9s, fast decisions)
-# Agent plan (JSON)    → Groq  llama-3.3-70b-versatile  (~1.9s, reliable JSON)
-# Code edit / Q&A      → NVIDIA qwen3-coder-480b         (~15s, strongest free coder)
-# Vision               → NVIDIA llama-3.2-11b-vision     (only option with vision)
+# ── Model routing (re-verified 2026-08-29) ──
+# Everything runs on Groq. The previous llama-3.3-70b line was retired by BOTH
+# providers within days of each other (Groq 404 model_not_found, NVIDIA 410
+# "end of life 2026-08-26"), which took chat, code, vision and RAG down at once.
+#
+# CHAT / RAG answers   → Groq  openai/gpt-oss-120b   (largest chat model offered)
+# Router (web search?) → Groq  openai/gpt-oss-20b    (a yes/no classifier; the
+#                                                     small model is plenty and
+#                                                     keeps routing latency low)
+# Agent plan (JSON)    → Groq  openai/gpt-oss-120b   (reliable structured output)
+# Code edit / Q&A      → Groq  openai/gpt-oss-120b
+# Vision               → Groq  qwen/qwen3.8-27b      (the only vision-capable
+#                                                     model Groq currently lists;
+#                                                     qwen3.6 also sees, but is a
+#                                                     reasoning model and leaks
+#                                                     <think> blocks into replies)
 
-MODEL        = "llama-3.3-70b-versatile"               # Groq — chat / RAG
-ROUTER_MODEL = "llama-3.3-70b-versatile"               # Groq — web-search routing
-PLAN_MODEL   = "llama-3.3-70b-versatile"               # Groq — agent JSON planning
-NVIDIA_CHAT_MODEL = "meta/llama-3.3-70b-instruct"      # NVIDIA — fallback chat / RAG
-CODE_MODEL   = "qwen/qwen3-coder-480b-a35b-instruct"   # NVIDIA — code edit / Q&A
-VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"    # NVIDIA — image / screenshot
+MODEL         = "openai/gpt-oss-120b"   # chat / RAG
+ROUTER_MODEL  = "openai/gpt-oss-20b"    # web-search routing
+PLAN_MODEL    = "openai/gpt-oss-120b"   # agent JSON planning
+CODE_MODEL    = "openai/gpt-oss-120b"   # code edit / Q&A
+VISION_MODEL  = "qwen/qwen3.8-27b"      # image / screenshot
+
+# Second Groq model, tried when the primary errors. This used to point at NVIDIA,
+# but that account now returns 403 "Authorization failed" for every inference
+# call, so an NVIDIA fallback is no fallback at all.
+FALLBACK_CHAT_MODEL = "qwen/qwen3.8-27b"
 
 ROUTER_SYSTEM = (
     "You are a routing classifier. You do NOT answer questions. "
@@ -510,16 +524,14 @@ def generate_followups(question: str, answer: str) -> list:
 
 
 def _chat_complete(messages: list, temperature: float = 0.3, max_tokens: int = 1024) -> str:
-    """Non-streaming chat completion with automatic Groq → NVIDIA fallback.
+    """Non-streaming chat completion, retried on a second model.
 
-    Groq is faster, but if its key is invalid / rate-limited / down (HTTP 401,
-    429, 5xx), retry on the NVIDIA-hosted equivalent so user-facing features
-    (translate, summary, …) keep working instead of silently returning empty.
+    If the primary model is rate-limited, retired, or erroring (HTTP 401, 404,
+    410, 429, 5xx), retry on the fallback so user-facing features (translate,
+    summary, …) keep working instead of silently returning empty.
     """
-    attempts = []
-    if groq_client is not None:
-        attempts.append((groq_client, MODEL, "groq"))
-    attempts.append((client, NVIDIA_CHAT_MODEL, "nvidia"))
+    c = _groq_or_nvidia()
+    attempts = [(c, MODEL, "groq"), (c, FALLBACK_CHAT_MODEL, "groq-fallback")]
     last_exc = None
     for attempt_client, attempt_model, provider in attempts:
         try:
@@ -603,13 +615,17 @@ def _strip_code_output(out: str) -> str:
 
 
 def _code_complete(messages: list, temperature: float, max_tokens: int) -> str:
-    """Run a code task on the powerful code model, falling back to MODEL on
-    timeout / unavailability. Uses a longer per-call timeout since the 480B MoE
-    coder is slower than the chat workhorse. Returns '' if every model fails."""
-    models = [CODE_MODEL] + ([MODEL] if MODEL != CODE_MODEL else [])
+    """Run a code task on the code model, falling back to the other chat models
+    on timeout / unavailability. Uses a longer per-call timeout since code tasks
+    produce long outputs. Returns '' if every model fails."""
+    c = _groq_or_nvidia()
+    models = []
+    for m in (CODE_MODEL, MODEL, FALLBACK_CHAT_MODEL):
+        if m not in models:
+            models.append(m)
     for m in models:
         try:
-            resp = client.with_options(timeout=120.0).chat.completions.create(
+            resp = c.with_options(timeout=120.0).chat.completions.create(
                 model=m,
                 messages=messages,
                 temperature=temperature,
@@ -1147,14 +1163,22 @@ def _sse(payload: dict) -> str:
 
 
 def _chat_stream_attempts(model: str):
-    """Return provider/model attempts for streaming chat."""
-    if model in (VISION_MODEL, CODE_MODEL):
-        return [(client, model, "nvidia")]
+    """Return client/model attempts for streaming chat.
 
-    attempts = []
-    if groq_client is not None:
-        attempts.append((groq_client, model, "groq"))
-    attempts.append((client, NVIDIA_CHAT_MODEL, "nvidia"))
+    Vision gets a single attempt — the fallback is text-only and would reject
+    the image. Everything else (chat, RAG, code) may retry on the second model.
+
+    Compare against VISION_MODEL only. Testing `model in (VISION_MODEL,
+    CODE_MODEL)` breaks the moment CODE_MODEL and MODEL are the same string:
+    ordinary chat would match the code branch and silently lose its fallback.
+    """
+    c = _groq_or_nvidia()
+    if model == VISION_MODEL:
+        return [(c, model, "vision")]
+
+    attempts = [(c, model, "groq")]
+    if model != FALLBACK_CHAT_MODEL:
+        attempts.append((c, FALLBACK_CHAT_MODEL, "groq-fallback"))
     return attempts
 
 
@@ -1168,15 +1192,34 @@ def _log_stream_start_error(provider: str, model: str, exc: Exception) -> None:
     )
 
 
+def _friendly_stream_error(exc: Exception | None) -> str:
+    """A user-facing sentence that still tells an operator what actually broke.
+
+    Never includes the provider's raw body — that can echo back the request or
+    the key. The status code alone separates "we're misconfigured" from "try
+    again in a minute", which is the distinction that matters on screen.
+    """
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return "The AI service rejected our credentials. The server needs attention."
+    if status in (404, 410):
+        return "The configured AI model is no longer available. The server needs attention."
+    if status == 429:
+        return "The AI service is rate-limited right now. Please try again in a moment."
+    if status is not None and status >= 500:
+        return "The AI service is temporarily unavailable. Please try again."
+    return "Failed to start the response. Please try again."
+
+
 def _stream_completion(messages: list, temperature: float, model: str = MODEL):
     """Yield SSE 'token' events from a streaming chat completion.
 
     Catches errors at both stream-open and per-chunk so a mid-stream failure
     surfaces as a clean SSE 'error' event instead of an uncaught exception
     that leaves the client with a half-finished response and no signal.
-    Uses Groq for chat models (faster) and NVIDIA for vision/code models.
     """
     stream = None
+    last_exc = None
     for attempt_client, attempt_model, provider in _chat_stream_attempts(model):
         try:
             stream = attempt_client.chat.completions.create(
@@ -1188,10 +1231,17 @@ def _stream_completion(messages: list, temperature: float, model: str = MODEL):
             )
             break
         except Exception as exc:
+            last_exc = exc
             _log_stream_start_error(provider, attempt_model, exc)
 
     if stream is None:
-        yield _sse({"type": "error", "message": "Failed to start the response."})
+        # Name the failure class in the user-facing message. A retired model or
+        # a dead key used to surface only as "Failed to start the response",
+        # which looked identical to a transient blip and hid a total outage.
+        yield _sse({
+            "type": "error",
+            "message": _friendly_stream_error(last_exc),
+        })
         return
 
     try:
