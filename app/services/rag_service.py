@@ -53,22 +53,32 @@ def _groq_or_nvidia():
 # "end of life 2026-08-26"), which took chat, code, vision and RAG down at once.
 #
 # CHAT / RAG answers   → Groq  openai/gpt-oss-120b   (largest chat model offered)
-# Router (web search?) → Groq  openai/gpt-oss-20b    (a yes/no classifier; the
-#                                                     small model is plenty and
-#                                                     keeps routing latency low)
 # Agent plan (JSON)    → Groq  openai/gpt-oss-120b   (reliable structured output)
 # Code edit / Q&A      → Groq  openai/gpt-oss-120b
+# Short utility calls  → Groq  qwen/qwen3.8-27b      (see below)
 # Vision               → Groq  qwen/qwen3.8-27b      (the only vision-capable
 #                                                     model Groq currently lists;
 #                                                     qwen3.6 also sees, but is a
 #                                                     reasoning model and leaks
 #                                                     <think> blocks into replies)
+#
+# gpt-oss is a REASONING model: it spends the token budget thinking before it
+# writes anything, and if the budget runs out first the reply comes back with
+# finish_reason='length' and content=''. Measured on the title prompt:
+# max_tokens=20 → empty, 40 → empty, 90+ → fine. How much it thinks depends on
+# the prompt, so any small budget is a coin flip.
+#
+# Every short call therefore uses a non-reasoning model, which answers directly
+# and is correct at every budget down to 20 tokens. That covers the web-search
+# router, chat titles, follow-up suggestions, widget starter questions and
+# research query generation — all of which want a fast, literal answer, not
+# deliberation.
 
 MODEL         = "openai/gpt-oss-120b"   # chat / RAG
-ROUTER_MODEL  = "openai/gpt-oss-20b"    # web-search routing
 PLAN_MODEL    = "openai/gpt-oss-120b"   # agent JSON planning
 CODE_MODEL    = "openai/gpt-oss-120b"   # code edit / Q&A
 VISION_MODEL  = "qwen/qwen3.8-27b"      # image / screenshot
+ROUTER_MODEL  = "qwen/qwen3.8-27b"      # short utility calls (see note above)
 
 # Second Groq model, tried when the primary errors. This used to point at NVIDIA,
 # but that account now returns 403 "Authorization failed" for every inference
@@ -1138,7 +1148,8 @@ def suggest_starter_questions(collection_name: str) -> list:
     )
     try:
         resp = _groq_or_nvidia().chat.completions.create(
-            model=MODEL,
+            # Short list output — see the ROUTER_MODEL note on reasoning models.
+            model=ROUTER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=140,
             temperature=0.4,
