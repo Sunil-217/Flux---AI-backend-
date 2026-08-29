@@ -412,3 +412,22 @@ def test_conversational_bypass_does_not_leak_factual_questions(fake_llm, fake_co
         tokens = [e["content"] for e in events if e["type"] == "token"]
         assert tokens == [rag_service.DOC_NOT_FOUND_MESSAGE], question
         assert not [c for c in fake_llm["calls"] if c.get("stream")], question
+
+
+# ── Threshold calibration anchors ────────────────────────────────────────────
+# Real similarity scores measured against jina-embeddings-v3 and a real PDF.
+# These pin the decision so a future threshold change has to confront the data.
+
+def test_threshold_keeps_the_measured_relevant_range():
+    """The weakest genuinely-relevant query measured 0.213; it must survive."""
+    assert rag_service._RAG_MIN_SIMILARITY < 0.213
+
+
+def test_threshold_rejects_the_reported_bug_case():
+    """"who is cm of tamil nadu" scored 0.085 against the test document."""
+    assert rag_service._RAG_MIN_SIMILARITY > 0.085
+
+
+def test_threshold_rejects_the_measured_unrelated_bulk():
+    """12 of 13 unrelated queries scored <= 0.145."""
+    assert rag_service._RAG_MIN_SIMILARITY > 0.145

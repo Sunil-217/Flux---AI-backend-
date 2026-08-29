@@ -970,9 +970,42 @@ def _ground_prompt(base_system: str, question: str, history: list, chat_id: str 
     return grounded
 
 
-# Chunks below this cosine similarity to the question are treated as irrelevant
-# (so off-topic questions don't show misleading "sources" from the PDF).
-_RAG_MIN_SIMILARITY = 0.3
+# Chunks below this cosine similarity to the question are treated as irrelevant.
+# Nothing above it means the document cannot answer, and stream_question refuses
+# instead of calling the model.
+#
+# Calibrated 2026-08-29 against real jina-embeddings-v3 vectors and a real PDF
+# (Close_AI_Feature_Guide.pdf, 11 chunks), scoring each query by its BEST match
+# across the chunks — which is what decides whether the guard fires:
+#
+#   relevant   (12 queries answerable from the PDF)  0.213 .. 0.828  median 0.405
+#   unrelated  (13 queries plainly not in the PDF)   0.015 .. 0.397  median 0.071
+#   borderline (5 plausible-but-absent)              0.121 .. 0.288  median 0.232
+#
+# The classes overlap only because of one query — "what is Python?" at 0.397,
+# which is genuinely adjacent to a document about an AI developer tool. Every
+# other unrelated query scores <= 0.145, so the real boundary sits in the wide
+# 0.145 .. 0.213 gap.
+#
+# Measured behaviour by threshold:
+#
+#   0.20   12/12 relevant kept   12/13 unrelated blocked   <- chosen
+#   0.25   11/12                 12/13
+#   0.30   10/12                 12/13                     <- previous value
+#   0.40    6/12                 13/13
+#
+# 0.30 was strictly worse than 0.20: it blocked no more unrelated queries and
+# refused two questions the document actually answers. Raising it far enough to
+# catch the outlier (0.40) costs half the recall, which is the wrong trade — a
+# user who knows the answer is in their PDF and is told it isn't has been failed
+# more visibly than one who gets a question politely declined.
+#
+# The outlier is caught by the second layer instead: SYSTEM_RAG instructs the
+# model to reply with DOC_NOT_FOUND_MESSAGE when the supplied context does not
+# support an answer. The threshold's job is the clear misses, not every miss.
+#
+# Caveat: calibrated on one document. Worth re-measuring against a larger corpus.
+_RAG_MIN_SIMILARITY = 0.20
 
 
 def _safe_metadata_filename(name: str) -> str:
