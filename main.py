@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import inspect, text
 from slowapi.errors import RateLimitExceeded
 
-from app.core.config import CORS_ORIGINS, ADMIN_EMAILS
+from app.core.config import CORS_ORIGINS, ADMIN_EMAILS, IS_PRODUCTION
 from app.core.rate_limit import limiter
 from app.db import Base, SessionLocal, engine
 from app import models  # noqa: F401  (register models on Base before create_all)
@@ -116,7 +116,15 @@ _ensure_schema()
 _bootstrap_admins()
 _seed_plans()
 
-app = FastAPI()
+# Interactive docs are a development convenience. In production they publish
+# the complete API surface — every admin route, every webhook path, every
+# request schema — to anyone who asks, which is free reconnaissance for no
+# benefit. Off unless APP_ENV says otherwise.
+app = FastAPI(
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
+)
 
 # ── Rate limiting (slowapi) ──
 app.state.limiter = limiter
