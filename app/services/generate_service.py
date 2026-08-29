@@ -1,11 +1,12 @@
 """Media + document generation:
-- Images via NVIDIA NIM FLUX.1-schnell (same key as chat — no extra signup).
+- Images via Pollinations.ai, falling back to NVIDIA NIM FLUX.1-schnell.
 - Videos via Pollinations.ai (no signup, generation triggered by the GET URL).
 - PDFs via xhtml2pdf (LLM writes Markdown -> we render to a styled PDF).
 
 All outbound calls are blocking; route handlers wrap them in run_in_threadpool.
 """
 
+import base64
 import io
 import urllib.parse
 
@@ -14,7 +15,12 @@ import requests
 from app.core.config import NVIDIA_API_KEY, POLLINATIONS_API_KEY
 
 
-# ── Image: NVIDIA NIM FLUX.1-schnell ─────────────────────────────────────────
+# ── Images ───────────────────────────────────────────────────────────────────
+# Per-attempt budget. Deliberately well under the frontend's 120s client
+# timeout: with two providers the worst case must still leave the user with an
+# error rather than a request the browser abandons first.
+_IMAGE_TIMEOUT = 45
+
 _IMAGE_URL = "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-schnell"
 # NIM FLUX accepts only this discrete set of side lengths — anything else 422s.
 _FLUX_ALLOWED_SIDES = (768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344)
@@ -77,7 +83,31 @@ def _extract_b64(payload):
     return None
 
 
-def generate_image_b64(prompt: str, width: int = 1024, height: int = 1024) -> str:
+def _image_via_pollinations(prompt: str, width: int, height: int) -> str:
+    """Generate an image via Pollinations. Returns a data: URI.
+
+    Returns raw image bytes rather than JSON, so there is no envelope to unwrap.
+    """
+    if not POLLINATIONS_API_KEY:
+        raise RuntimeError("POLLINATIONS_API_KEY is not configured.")
+
+    encoded = urllib.parse.quote(prompt.strip())[:500]
+    r = requests.get(
+        f"https://image.pollinations.ai/prompt/{encoded}",
+        headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"},
+        params={"width": int(width or 1024), "height": int(height or 1024), "nologo": "true"},
+        timeout=_IMAGE_TIMEOUT,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Pollinations image API returned {r.status_code}: {r.text[:200]}")
+    if not r.content or not (r.headers.get("content-type") or "").startswith("image/"):
+        raise RuntimeError("Pollinations image API returned no image data.")
+
+    b64 = base64.b64encode(r.content).decode()
+    return f"data:{_mime_from_b64(b64)};base64,{b64}"
+
+
+def _image_via_nvidia(prompt: str, width: int, height: int) -> str:
     """Generate an image via NVIDIA NIM FLUX.1-schnell. Returns a data: URI."""
     if not NVIDIA_API_KEY:
         raise RuntimeError("NVIDIA_API_KEY is not configured.")
@@ -100,7 +130,7 @@ def generate_image_b64(prompt: str, width: int = 1024, height: int = 1024) -> st
             "seed": 0,
             "steps": 4,
         },
-        timeout=90,
+        timeout=_IMAGE_TIMEOUT,
     )
     if r.status_code >= 400:
         raise RuntimeError(f"NVIDIA NIM image API returned {r.status_code}: {r.text[:300]}")
@@ -117,6 +147,46 @@ def generate_image_b64(prompt: str, width: int = 1024, height: int = 1024) -> st
     b64 = "".join(b64.split())
     mime = _mime_from_b64(b64)
     return f"data:{mime};base64,{b64}"
+
+
+def generate_image_b64(prompt: str, width: int = 1024, height: int = 1024) -> str:
+    """Generate an image, trying each configured provider in turn.
+
+    Pollinations goes first. NVIDIA was the original provider, but the account
+    now fails every inference call — chat and embeddings return 403 immediately,
+    while the image endpoint hangs until the socket times out. Measured
+    2026-08-29 from production: 103.8s, then HTTP 502 and no image. Pollinations
+    answered the same prompt in 1.2s.
+
+    NVIDIA stays as a fallback so a restored account is picked up automatically,
+    but it is no longer allowed to cost the user a minute and a half before
+    failing: _IMAGE_TIMEOUT bounds each attempt, so the worst case is bounded
+    and the user gets a real error instead of an eternal spinner.
+    """
+    attempts = []
+    if POLLINATIONS_API_KEY:
+        attempts.append(("pollinations", _image_via_pollinations))
+    if NVIDIA_API_KEY:
+        attempts.append(("nvidia", _image_via_nvidia))
+    if not attempts:
+        raise RuntimeError(
+            "No image provider is configured. Set POLLINATIONS_API_KEY "
+            "(free signup: https://enter.pollinations.ai/)."
+        )
+
+    errors = []
+    for name, fn in attempts:
+        try:
+            return fn(prompt, width, height)
+        except Exception as exc:
+            # Named per provider so the server log says which one failed and why
+            # — the route used to collapse every failure into the same opaque
+            # "Image generation failed." with nothing written down anywhere.
+            detail = str(exc).replace("\n", " ")[:300]
+            print(f"Image generation failed via {name}: {exc.__class__.__name__}: {detail}", flush=True)
+            errors.append(f"{name}: {exc.__class__.__name__}")
+
+    raise RuntimeError("Image generation failed (" + "; ".join(errors) + ").")
 
 
 # ── Video: Pollinations.ai (free signup required as of mid-2026) ─────────────
