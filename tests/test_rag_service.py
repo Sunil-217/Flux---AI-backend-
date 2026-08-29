@@ -431,3 +431,95 @@ def test_threshold_rejects_the_reported_bug_case():
 def test_threshold_rejects_the_measured_unrelated_bulk():
     """12 of 13 unrelated queries scored <= 0.145."""
     assert rag_service._RAG_MIN_SIMILARITY > 0.145
+
+
+# ── Web off with no grounded source ──────────────────────────────────────────
+# Reported from production: web search off, no document selected,
+# "who is cm of tamil nadu" answered "M.K. Stalin is the Chief Minister…"
+# straight from pretrained knowledge.
+
+def test_web_off_no_document_refuses_the_reported_case(fake_llm, fake_collection):
+    """THE regression test for the reported bug, verbatim."""
+    fake_collection.count.return_value = 0
+    events = _parse(
+        rag_service.stream_question("c1", "who is cm of tamil nadu", [], web_search=False)
+    )
+    tokens = [e["content"] for e in events if e["type"] == "token"]
+    assert tokens == [rag_service.NO_GROUNDED_SOURCE_MESSAGE]
+    assert events[-1]["type"] == "done"
+    # The model must not be consulted at all.
+    assert not [c for c in fake_llm["calls"] if c.get("stream")]
+    assert "Stalin" not in "".join(tokens)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "who is cm of tamil nadu",
+        "what is the bitcoin price today",
+        "latest news in India",
+        "who won the last IPL",
+        "what is the weather today",
+        "who is the current president",
+    ],
+)
+def test_web_off_no_document_refuses_time_sensitive(question, fake_llm, fake_collection):
+    fake_collection.count.return_value = 0
+    events = _parse(rag_service.stream_question("c1", question, [], web_search=False))
+    tokens = [e["content"] for e in events if e["type"] == "token"]
+    assert tokens == [rag_service.NO_GROUNDED_SOURCE_MESSAGE], question
+    assert not [c for c in fake_llm["calls"] if c.get("stream")], question
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Not time-sensitive: pretrained knowledge here is neither stale nor
+        # misleading, and refusing it would gut the assistant with web off.
+        "what is Python",
+        "explain recursion",
+        "write a poem about rain",
+        "what is the capital of France",
+        "summarize our chat",
+        "fix this code",
+        # Small talk must never be caught by the guard.
+        "hi", "hello", "thanks", "good morning", "bye",
+    ],
+)
+def test_web_off_no_document_still_answers_non_time_sensitive(question, fake_llm, fake_collection):
+    fake_collection.count.return_value = 0
+    fake_llm["stream_tokens"] = ["Sure", "."]
+    events = _parse(rag_service.stream_question("c1", question, [], web_search=False))
+    reply = "".join(e["content"] for e in events if e["type"] == "token")
+    assert reply == "Sure.", question
+    assert rag_service.NO_GROUNDED_SOURCE_MESSAGE not in reply, question
+
+
+def test_web_on_no_document_still_uses_web_search(monkeypatch, fake_llm, fake_collection):
+    """The guard must not fire when web access is available."""
+    fake_collection.count.return_value = 0
+    calls = []
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    monkeypatch.setattr(rag_service, "run_web_search", lambda q: calls.append(q) or "M.K. Stalin.")
+    fake_llm["router"] = "current chief minister of Tamil Nadu"
+    fake_llm["stream_tokens"] = ["M.K. ", "Stalin."]
+    events = _parse(
+        rag_service.stream_question("c1", "who is cm of tamil nadu", [], web_search=True)
+    )
+    reply = "".join(e["content"] for e in events if e["type"] == "token")
+    assert reply == "M.K. Stalin."
+    assert calls, "web search should have been called"
+
+
+def test_document_mode_is_unaffected_by_the_web_off_guard(fake_llm, fake_collection):
+    """A time-sensitive question with a document selected still goes through
+    document grounding and refuses with the DOCUMENT message, not this one."""
+    _irrelevant_chunks(fake_collection)
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "who is cm of tamil nadu", [], web_search=False, active_docs=["a.pdf"]
+        )
+    )
+    tokens = [e["content"] for e in events if e["type"] == "token"]
+    assert tokens == [rag_service.DOC_NOT_FOUND_MESSAGE]
+    assert not [c for c in fake_llm["calls"] if c.get("stream")]
