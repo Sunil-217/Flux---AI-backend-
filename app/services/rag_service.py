@@ -412,6 +412,45 @@ SYSTEM_RAG = (
 )
 
 
+# Small talk that should still work while a document is selected: "hi",
+# "thanks", "ok cool". Without this, strict document mode answers a greeting
+# with "I couldn't find this information in the selected document."
+#
+# Deliberately a closed vocabulary rather than a pattern, because the cost of
+# being too broad is the bug this whole change exists to prevent: one factual
+# question slipping through here goes straight to the model's own knowledge.
+# A message qualifies only if it is at most _CONVERSATIONAL_MAX_WORDS long AND
+# every single word is on the list. "hi" passes; "hi, who is the CM?" does not,
+# because "who", "is" and "cm" are not on it.
+_CONVERSATIONAL_MAX_WORDS = 4
+_CONVERSATIONAL_WORDS = frozenset(
+    """
+    hi hii hiii hey heyy hello helo hiya yo namaste vanakkam
+    good morning afternoon evening night day
+    thanks thank thanku thankyou thx tysm ty nandri
+    ok okay okey k cool nice great awesome perfect lovely super
+    got it understood noted fine alright
+    bye goodbye see cya later
+    sorry please welcome
+    yes yeah yep yup no nope sure
+    da bro dude mate there you u
+    very much
+    """.split()
+)
+
+
+def _is_conversational(question: str) -> bool:
+    """True for pure small talk — greetings, thanks, acknowledgements.
+
+    Must never return True for anything that asks for a fact, because the
+    caller uses it to skip document grounding entirely.
+    """
+    words = re.findall(r"[a-z']+", (question or "").lower())
+    if not words or len(words) > _CONVERSATIONAL_MAX_WORDS:
+        return False
+    return all(w in _CONVERSATIONAL_WORDS for w in words)
+
+
 # Cheap local pre-filter: only questions matching these time-sensitive signals
 # are sent to the (slower) LLM router + web search. Everything else streams
 # immediately — so greetings, coding and general questions answer in ~1s.
@@ -1339,7 +1378,11 @@ def stream_question(
 
         collection = get_or_create_collection(chat_id)
 
-        if collection.count() == 0:
+        # Small talk is answered conversationally even with a document open —
+        # retrieving chunks for "thanks" is meaningless, and refusing it reads
+        # as a bug. Everything that is not pure small talk stays inside strict
+        # document grounding below.
+        if collection.count() == 0 or _is_conversational(question):
             system_prompt = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(history)

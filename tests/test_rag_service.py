@@ -326,3 +326,89 @@ def test_rag_prompt_forbids_general_knowledge():
     assert "ONLY the supplied document context" in rag_service.SYSTEM_RAG
     assert rag_service.DOC_NOT_FOUND_MESSAGE in rag_service.SYSTEM_RAG
     assert "using your own knowledge" not in rag_service.SYSTEM_RAG
+
+
+# ── Conversational exception inside document mode ────────────────────────────
+# Small talk stays conversational; anything that asks for a fact does not.
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "hi", "hello", "Hey!", "hiya",
+        "thanks", "Thanks!", "thank you", "thank you very much", "thx",
+        "ok", "ok cool", "got it", "noted",
+        "good morning", "good night",
+        "bye", "see you later",
+        "vanakkam", "nandri da",
+    ],
+)
+def test_is_conversational_accepts_small_talk(message):
+    assert rag_service._is_conversational(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # The whole point: a factual question must never take the bypass.
+        "who is CM of Tamil Nadu?",
+        "what is Python?",
+        "what is the capital of France",
+        # Greeting glued to a real question must not sneak through.
+        "hi, who is the CM?",
+        "thanks, now what is python",
+        "good morning what is the revenue",
+        # Document questions stay in document mode.
+        "what does the document say",
+        "summarize this",
+        "python",
+        "",
+    ],
+)
+def test_is_conversational_rejects_questions(message):
+    assert rag_service._is_conversational(message) is False
+
+
+def test_greeting_in_document_mode_gets_a_normal_reply(fake_llm, fake_collection):
+    """A document is open, web is off — "hi" must not be refused."""
+    _irrelevant_chunks(fake_collection)
+    fake_llm["stream_tokens"] = ["Hello! ", "How can I help?"]
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "hi", [], web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+        )
+    )
+    reply = "".join(e["content"] for e in events if e["type"] == "token")
+    assert reply == "Hello! How can I help?"
+    assert rag_service.DOC_NOT_FOUND_MESSAGE not in reply
+    # Answered as ordinary chat, so no document context was pasted in.
+    stream_calls = [c for c in fake_llm["calls"] if c.get("stream")]
+    assert "Document Context" not in stream_calls[-1]["messages"][0]["content"]
+
+
+def test_thanks_in_document_mode_gets_a_normal_reply(fake_llm, fake_collection):
+    _irrelevant_chunks(fake_collection)
+    fake_llm["stream_tokens"] = ["You're ", "welcome!"]
+    events = _parse(
+        rag_service.stream_question(
+            "c1", "thanks", [], web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+        )
+    )
+    reply = "".join(e["content"] for e in events if e["type"] == "token")
+    assert reply == "You're welcome!"
+    assert rag_service.DOC_NOT_FOUND_MESSAGE not in reply
+
+
+def test_conversational_bypass_does_not_leak_factual_questions(fake_llm, fake_collection):
+    """The exception must be narrow: a fact question still gets refused, and
+    the model is never asked."""
+    _irrelevant_chunks(fake_collection)
+    for question in ("who is CM of Tamil Nadu?", "what is Python?", "hi, who is the CM?"):
+        fake_llm["calls"].clear()
+        events = _parse(
+            rag_service.stream_question(
+                "c1", question, [], web_search=False, active_docs=["Sunil_Gen_AI.pdf"]
+            )
+        )
+        tokens = [e["content"] for e in events if e["type"] == "token"]
+        assert tokens == [rag_service.DOC_NOT_FOUND_MESSAGE], question
+        assert not [c for c in fake_llm["calls"] if c.get("stream")], question
