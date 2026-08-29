@@ -390,6 +390,14 @@ SYSTEM_NORMAL = (
 # contain the answer), so the user sees one consistent reply either way.
 DOC_NOT_FOUND_MESSAGE = "I couldn't find this information in the selected document."
 
+# Web access off and nothing uploaded: there is no grounded source at all. Says
+# what is missing AND how to fix it, because "I can't answer that" alone leaves
+# the user with no move.
+NO_GROUNDED_SOURCE_MESSAGE = (
+    "That needs current information, and web search is off with no document "
+    "selected. Turn on web search, or upload a document that covers it."
+)
+
 SYSTEM_RAG = (
     "You are Close AI, answering questions about the selected document.\n\n"
     "Guidelines:\n"
@@ -1410,12 +1418,29 @@ def stream_question(
             return
 
         collection = get_or_create_collection(chat_id)
+        has_documents = collection.count() > 0
+
+        # No document AND no web access: nothing grounded is available. For a
+        # time-sensitive question the model could only answer from its training
+        # data, which is stale by construction — it would name last year's
+        # office-holder or price with full confidence and no way for the reader
+        # to tell. Refuse and say which switch fixes it.
+        #
+        # Deliberately scoped to time-sensitive questions only. "What is
+        # Python" answered from pretrained knowledge is neither stale nor
+        # misleading, and refusing it would make the assistant useless whenever
+        # web search is off. _might_need_fresh_info never matches small talk,
+        # so greetings still get a normal reply.
+        if not has_documents and not web_search and _might_need_fresh_info(question):
+            yield _sse({"type": "token", "content": NO_GROUNDED_SOURCE_MESSAGE})
+            yield _sse({"type": "done"})
+            return
 
         # Small talk is answered conversationally even with a document open —
         # retrieving chunks for "thanks" is meaningless, and refusing it reads
         # as a bug. Everything that is not pure small talk stays inside strict
         # document grounding below.
-        if collection.count() == 0 or _is_conversational(question):
+        if not has_documents or _is_conversational(question):
             system_prompt = _ground_prompt(SYSTEM_NORMAL, question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(history)
