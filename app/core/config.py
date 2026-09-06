@@ -87,8 +87,15 @@ def _enforce_production_safety() -> None:
             "CORS_ORIGINS must be set to your real frontend URL(s) in production "
             "(currently defaulting to localhost — the backend will be unreachable)."
         )
-    if not NVIDIA_API_KEY:
-        problems.append("NVIDIA_API_KEY is required.")
+    # Guard the key the app actually runs on. This used to require
+    # NVIDIA_API_KEY, which stopped being the chat provider — so a deploy with
+    # no GROQ_API_KEY started cleanly and then failed on every single message,
+    # which is the opposite of failing fast.
+    if not GROQ_API_KEY:
+        problems.append(
+            "GROQ_API_KEY is required — chat, routing, code and vision all run on it. "
+            "Free key: https://console.groq.com/keys"
+        )
     if problems:
         msg = "\n  - ".join(["Production startup blocked:"] + problems)
         print(msg, file=sys.stderr, flush=True)
