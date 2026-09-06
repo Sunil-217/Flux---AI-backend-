@@ -3,15 +3,12 @@ import re
 from datetime import datetime
 
 import numpy as np
-from openai import OpenAI
 
 from app.db import SessionLocal
 from app.models import ChatWebContext
 
-from app.core.config import (
-    NVIDIA_API_KEY,
-    GROQ_API_KEY,
-)
+from app.services import llm_provider
+from app.services.llm_provider import classify_error, friendly_error, plan_attempts
 
 from app.services.chroma_service import (
     get_or_create_collection
@@ -26,25 +23,24 @@ from app.services.web_search_service import (
     is_search_available
 )
 
-# ── NVIDIA client — Code editing + Vision (most powerful free code specialist) ──
-client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=NVIDIA_API_KEY,
-    timeout=60.0,
-)
+# ── Clients ──────────────────────────────────────────────────────────────────
+# Both clients are now CONSTRUCTED IN ONE PLACE (llm_provider) and merely
+# re-exported here. They used to be built twice with slightly different
+# timeouts and key-fallback rules, which meant "which client am I on?" had two
+# possible answers depending on the call site. These names stay because several
+# modules import them; they are the same objects the provider layer uses, so
+# routing, breakers and fallback apply no matter which name a caller reaches for.
+client = llm_provider._providers[llm_provider.NVIDIA].client       # NVIDIA NIM
+groq_client = llm_provider._providers[llm_provider.GROQ].client    # Groq
 
-# ── Groq client — Chat / Router / Plan (same llama-3.3-70b, 3-5x faster inference) ──
-# Groq benchmarked at ~1.9s vs NVIDIA's ~5-10s for the same model. Chat, routing,
-# and JSON planning all benefit from lower latency. Falls back to NVIDIA client
-# automatically if GROQ_API_KEY is absent (see _groq_or_nvidia).
-groq_client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=GROQ_API_KEY or NVIDIA_API_KEY,  # graceful fallback if key missing
-    timeout=30.0,
-) if GROQ_API_KEY else None
 
 def _groq_or_nvidia():
-    """Return the Groq client when available, otherwise the NVIDIA client."""
+    """Return the Groq client when available, otherwise the NVIDIA client.
+
+    Kept for the direct, non-routed call sites (titles, follow-ups, quiz,
+    research). New code should call `llm_provider.complete(role, ...)` instead,
+    which adds classification, fallback and the circuit breaker.
+    """
     return groq_client if groq_client is not None else client
 
 # ── Model routing (re-verified 2026-08-29) ──
@@ -74,16 +70,16 @@ def _groq_or_nvidia():
 # research query generation — all of which want a fast, literal answer, not
 # deliberation.
 
-MODEL         = "openai/gpt-oss-120b"   # chat / RAG
-PLAN_MODEL    = "openai/gpt-oss-120b"   # agent JSON planning
-CODE_MODEL    = "openai/gpt-oss-120b"   # code edit / Q&A
-VISION_MODEL  = "qwen/qwen3.8-27b"      # image / screenshot
-ROUTER_MODEL  = "qwen/qwen3.8-27b"      # short utility calls (see note above)
-
-# Second Groq model, tried when the primary errors. This used to point at NVIDIA,
-# but that account now returns 403 "Authorization failed" for every inference
-# call, so an NVIDIA fallback is no fallback at all.
-FALLBACK_CHAT_MODEL = "qwen/qwen3.8-27b"
+# The ids themselves now live in config so a model can be swapped by setting an
+# env var instead of shipping code. The defaults are unchanged.
+from app.core.config import (  # noqa: E402  (kept next to the routing note)
+    CODE_MODEL,
+    FALLBACK_CHAT_MODEL,
+    MODEL,
+    PLAN_MODEL,
+    ROUTER_MODEL,
+    VISION_MODEL,
+)
 
 ROUTER_SYSTEM = (
     "You are a routing classifier. You do NOT answer questions. "
@@ -595,13 +591,15 @@ def _chat_complete(messages: list, temperature: float = 0.3, max_tokens: int = 1
     410, 429, 5xx), retry on the fallback so user-facing features (translate,
     summary, …) keep working instead of silently returning empty.
     """
-    c = _groq_or_nvidia()
-    attempts = [(c, MODEL, "groq"), (c, FALLBACK_CHAT_MODEL, "groq-fallback")]
-    last_exc = None
-    for attempt_client, attempt_model, provider in attempts:
+    # Attempts come from the provider layer, so this crosses providers instead
+    # of retrying the same client twice. The empty-result retry is kept
+    # deliberately: a reasoning model that runs out of budget mid-thought
+    # returns finish_reason='length' with content='' — a successful call with
+    # nothing in it, which the next model in the chain usually answers fine.
+    for attempt in plan_attempts("chat"):
         try:
-            resp = attempt_client.chat.completions.create(
-                model=attempt_model,
+            resp = llm_provider._providers[attempt.provider].client.chat.completions.create(
+                model=attempt.model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -610,8 +608,16 @@ def _chat_complete(messages: list, temperature: float = 0.3, max_tokens: int = 1
             if out:
                 return out
         except Exception as exc:  # noqa: BLE001 — try the next provider
-            last_exc = exc
-            print(f"_chat_complete failed via {provider} ({attempt_model}): {exc}", flush=True)
+            # Log the failure CLASS, never `exc` itself: the provider's body can
+            # echo back the request — or the key — straight into the logs.
+            kind = classify_error(exc)
+            llm_provider.log_event("chat_complete", provider=attempt.provider,
+                                   model=attempt.model, ok=False, kind=kind,
+                                   error=exc.__class__.__name__)
+            if kind in (llm_provider.ErrorKind.AUTH, llm_provider.ErrorKind.MODEL_UNAVAILABLE):
+                llm_provider._trip_breaker(attempt.provider, attempt.model, kind)
+            elif kind == llm_provider.ErrorKind.INVALID_REQUEST:
+                break
             continue
     return ""
 
@@ -1254,23 +1260,34 @@ def _sse(payload: dict) -> str:
 
 
 def _chat_stream_attempts(model: str):
-    """Return client/model attempts for streaming chat.
+    """Return (client, model, provider) attempts for streaming chat.
 
-    Vision gets a single attempt — the fallback is text-only and would reject
-    the image. Everything else (chat, RAG, code) may retry on the second model.
+    The chain now comes from the provider layer, so chat gets the same
+    cross-provider fallback the agents get: if Groq is rate-limited or down and
+    NVIDIA is configured, the answer still arrives. Previously both "attempts"
+    used the same client, so a provider-level outage failed twice and reported
+    it once.
+
+    Vision resolves through the "vision" role, which the provider layer builds
+    without a text-only fallback — that fallback would reject the image.
 
     Compare against VISION_MODEL only. Testing `model in (VISION_MODEL,
     CODE_MODEL)` breaks the moment CODE_MODEL and MODEL are the same string:
     ordinary chat would match the code branch and silently lose its fallback.
     """
-    c = _groq_or_nvidia()
-    if model == VISION_MODEL:
-        return [(c, model, "vision")]
+    role = "vision" if model == VISION_MODEL else "chat"
+    attempts = [
+        (llm_provider._providers[a.provider].client, a.model, a.provider)
+        for a in plan_attempts(role, model_override=model)
+    ]
+    if attempts:
+        return attempts
 
-    attempts = [(c, model, "groq")]
-    if model != FALLBACK_CHAT_MODEL:
-        attempts.append((c, FALLBACK_CHAT_MODEL, "groq-fallback"))
-    return attempts
+    # Every provider is unconfigured or broken. Fall back to whichever client
+    # exists so the caller still gets a real error from a real call rather than
+    # an empty chain it has to special-case.
+    c = _groq_or_nvidia()
+    return [(c, model, "direct")] if c is not None else []
 
 
 def _log_stream_start_error(provider: str, model: str, exc: Exception) -> None:
@@ -1287,19 +1304,15 @@ def _friendly_stream_error(exc: Exception | None) -> str:
     """A user-facing sentence that still tells an operator what actually broke.
 
     Never includes the provider's raw body — that can echo back the request or
-    the key. The status code alone separates "we're misconfigured" from "try
+    the key. The failure CLASS alone separates "we're misconfigured" from "try
     again in a minute", which is the distinction that matters on screen.
+
+    Classification now lives in llm_provider so the chat path and the agent path
+    describe the same failure the same way.
     """
-    status = getattr(exc, "status_code", None)
-    if status in (401, 403):
-        return "The AI service rejected our credentials. The server needs attention."
-    if status in (404, 410):
-        return "The configured AI model is no longer available. The server needs attention."
-    if status == 429:
-        return "The AI service is rate-limited right now. Please try again in a moment."
-    if status is not None and status >= 500:
-        return "The AI service is temporarily unavailable. Please try again."
-    return "Failed to start the response. Please try again."
+    if exc is None:
+        return friendly_error("unknown")
+    return friendly_error(classify_error(exc))
 
 
 def _stream_completion(messages: list, temperature: float, model: str = MODEL):
@@ -1324,6 +1337,15 @@ def _stream_completion(messages: list, temperature: float, model: str = MODEL):
         except Exception as exc:
             last_exc = exc
             _log_stream_start_error(provider, attempt_model, exc)
+            # A dead key or a retired model is permanent. Record it so the next
+            # request skips the attempt instead of paying the round-trip again.
+            kind = classify_error(exc)
+            if kind in (llm_provider.ErrorKind.AUTH, llm_provider.ErrorKind.MODEL_UNAVAILABLE):
+                llm_provider._trip_breaker(provider, attempt_model, kind)
+            elif kind == llm_provider.ErrorKind.INVALID_REQUEST:
+                # Malformed for one provider is malformed for all of them —
+                # retrying only multiplies the latency of a certain failure.
+                break
 
     if stream is None:
         # Name the failure class in the user-facing message. A retired model or

@@ -64,10 +64,15 @@ def test_stream_question_normal_yields_tokens_then_done(fake_llm, fake_collectio
 
 
 def test_stream_question_falls_back_when_first_provider_cannot_start(
-    monkeypatch, fake_llm, fake_collection
+    fake_llm, fake_collection
 ):
+    """A provider that cannot open the stream must not cost the user the answer.
+
+    The retry now crosses PROVIDERS, not just models: the second attempt runs on
+    a different provider entirely, so a Groq outage is survivable instead of
+    being retried twice against the same dead endpoint.
+    """
     fake_collection.count.return_value = 0
-    monkeypatch.setattr(rag_service, "groq_client", rag_service.client)
     fake_llm["fail_stream_once"] = True
     fake_llm["stream_tokens"] = ["fallback"]
 
@@ -77,7 +82,10 @@ def test_stream_question_falls_back_when_first_provider_cannot_start(
     assert events[-1]["type"] == "done"
     stream_calls = [c for c in fake_llm["calls"] if c.get("stream")]
     assert len(stream_calls) == 2
-    assert stream_calls[-1]["model"] == rag_service.FALLBACK_CHAT_MODEL
+    # First attempt is the configured chat model; the retry is a genuinely
+    # different (provider, model) pair rather than the same call repeated.
+    assert stream_calls[0]["model"] == rag_service.MODEL
+    assert stream_calls[-1]["model"] != stream_calls[0]["model"]
 
 
 def test_stream_question_rag_emits_sources_first(fake_llm, fake_collection):
