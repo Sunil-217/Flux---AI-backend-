@@ -48,13 +48,14 @@ from app.core.config import (
     CODE_PROVIDER,
     CRITIC_MODEL,
     FALLBACK_CHAT_MODEL,
-    FALLBACK_MAX_TOKENS,
+    MODEL_OUTPUT_CAPS,
     GROQ_API_KEY,
     MODEL,
     NVIDIA_API_KEY,
     NVIDIA_CODE_MODEL,
     NVIDIA_MODEL,
     NVIDIA_PLAN_MODEL,
+    NVIDIA_VISION_MODEL,
     ORCHESTRATOR_PROVIDER,
     PLAN_MODEL,
     PLANNER_PROVIDER,
@@ -174,19 +175,31 @@ class _Provider:
         return self.client is not None and not self.disabled
 
 
+# The OpenAI SDK retries twice by default, INSIDE a single call. That silently
+# turns each of our attempts into three, multiplies the timeout we configured by
+# three, and does it where our classification, logging and breakers cannot see
+# it. Measured: a throttled vision request took 92s against a 30s timeout, and
+# the chain looked like one attempt the whole time.
+#
+# Retrying is this module's job and it is bounded and observable. The SDK's copy
+# is turned off so the timeout means what it says.
+_SDK_RETRIES = 0
+
 _lock = threading.Lock()
 
 _providers: dict[str, _Provider] = {
     GROQ: _Provider(
         GROQ,
-        OpenAI(base_url=_GROQ_BASE_URL, api_key=GROQ_API_KEY, timeout=30.0)
+        OpenAI(base_url=_GROQ_BASE_URL, api_key=GROQ_API_KEY, timeout=30.0,
+               max_retries=_SDK_RETRIES)
         if GROQ_API_KEY else None,
     ),
     NVIDIA: _Provider(
         NVIDIA,
         # NVIDIA's larger reasoning checkpoints think for a while before the
         # first token, so they get a longer ceiling than Groq's.
-        OpenAI(base_url=_NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY, timeout=90.0)
+        OpenAI(base_url=_NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY, timeout=90.0,
+               max_retries=_SDK_RETRIES)
         if NVIDIA_API_KEY else None,
     ),
 }
@@ -242,8 +255,9 @@ class Attempt:
     provider: str
     model: str
     # Caps this attempt's output budget below whatever the caller asked for.
-    # Set on the fallback attempt, whose model has a much smaller per-minute
-    # output allowance than the primary — see FALLBACK_MAX_TOKENS.
+    # Comes from MODEL_OUTPUT_CAPS: some models carry a much smaller per-minute
+    # output allowance than the primary, and asking for more is refused outright
+    # rather than merely queued.
     max_tokens: Optional[int] = None
 
     def budget(self, requested: int) -> int:
@@ -256,7 +270,7 @@ _ROLES: dict[str, tuple[str, str, str]] = {
     "chat":        (CHAT_PROVIDER, MODEL, NVIDIA_MODEL),
     "router":      (ROUTER_PROVIDER, ROUTER_MODEL, NVIDIA_MODEL),
     "code":        (CODE_PROVIDER, CODE_MODEL, NVIDIA_CODE_MODEL),
-    "vision":      (VISION_PROVIDER, VISION_MODEL, VISION_MODEL),
+    "vision":      (VISION_PROVIDER, VISION_MODEL, NVIDIA_VISION_MODEL),
     "plan":        (PLANNER_PROVIDER, PLAN_MODEL, NVIDIA_PLAN_MODEL),
     "orchestrate": (ORCHESTRATOR_PROVIDER, PLAN_MODEL, NVIDIA_PLAN_MODEL),
     # Self-evaluation: a short JSON verdict, not deliberation. See CRITIC_MODEL.
@@ -293,7 +307,7 @@ def plan_attempts(role: str, model_override: Optional[str] = None) -> list[Attem
             model = model_override if (model_override and name == GROQ) else by_provider[name]
             if model in p.dead_models:
                 continue
-            attempts.append(Attempt(name, model))
+            attempts.append(Attempt(name, model, max_tokens=MODEL_OUTPUT_CAPS.get(model)))
 
         # Same-provider second model, so a single bad Groq model still has a way
         # through even when NVIDIA is not configured at all. Vision is excluded:
@@ -301,7 +315,8 @@ def plan_attempts(role: str, model_override: Optional[str] = None) -> list[Attem
         if role != "vision":
             g = _providers[GROQ]
             if g.available and FALLBACK_CHAT_MODEL not in g.dead_models:
-                extra = Attempt(GROQ, FALLBACK_CHAT_MODEL, max_tokens=FALLBACK_MAX_TOKENS)
+                extra = Attempt(GROQ, FALLBACK_CHAT_MODEL,
+                                max_tokens=MODEL_OUTPUT_CAPS.get(FALLBACK_CHAT_MODEL))
                 if not any(a.provider == extra.provider and a.model == extra.model
                            for a in attempts):
                     attempts.append(extra)

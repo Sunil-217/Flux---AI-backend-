@@ -59,17 +59,39 @@ CRITIC_MODEL = os.getenv("CRITIC_MODEL") or "qwen/qwen3.8-27b"
 
 # Second Groq model, tried when the primary errors.
 FALLBACK_CHAT_MODEL = os.getenv("FALLBACK_CHAT_MODEL") or "qwen/qwen3.8-27b"
-# Output budget for the FALLBACK attempt only.
+
+# ── Per-model output ceilings ─────────────────────────────────────────────────
+# A cap belongs to the MODEL, not to the role that happens to be using it.
 #
-# Measured against the live account: this model carries an output-tokens-per-
-# minute cap of 1,000, so asking it for the normal 4,096 is refused outright —
+# Measured against the live account: `qwen/qwen3.8-27b` carries an
+# output-tokens-per-minute allowance of 1,000, so any request asking it for the
+# normal 4,096 is refused outright, whatever budget remains:
 #   "Request too large ... on output tokens per minute (OTPM): Limit 1000,
-#    Requested 1040 ... reduce max_tokens"
-# — every single time, whatever the remaining budget. The fallback was therefore
-# structurally incapable of ever answering: it existed, it was tried, and it
-# always 429'd. A shorter answer from the backup model is the entire point of
-# having one; a guaranteed failure is not. Raise this on a paid tier.
-FALLBACK_MAX_TOKENS = int(os.getenv("FALLBACK_MAX_TOKENS", "900"))
+#    Requested 1631 ... reduce max_tokens"
+# That one id is the fallback model AND the vision model AND the router AND the
+# critic, so capping it per-role fixed the fallback and left vision failing on
+# every single image. Keyed by model, it is fixed everywhere at once.
+#
+# Override with MODEL_OUTPUT_CAPS="model-a=900,model-b=2000"; a paid tier can
+# raise or remove these.
+SMALL_MODEL_MAX_TOKENS = int(os.getenv("SMALL_MODEL_MAX_TOKENS", "900"))
+
+
+def _parse_output_caps(raw: str) -> dict:
+    caps = {}
+    for pair in (raw or "").split(","):
+        model, _, value = pair.partition("=")
+        model, value = model.strip(), value.strip()
+        if model and value.isdigit():
+            caps[model] = int(value)
+    return caps
+
+
+MODEL_OUTPUT_CAPS = _parse_output_caps(os.getenv("MODEL_OUTPUT_CAPS", "")) or {
+    m: SMALL_MODEL_MAX_TOKENS
+    for m in {FALLBACK_CHAT_MODEL, VISION_MODEL, ROUTER_MODEL, CRITIC_MODEL}
+    if m == "qwen/qwen3.8-27b"
+}
 
 # NVIDIA NIM — optional secondary provider (https://build.nvidia.com).
 # Picked for agentic reasoning and planning rather than by name recognition:
@@ -81,6 +103,11 @@ FALLBACK_MAX_TOKENS = int(os.getenv("FALLBACK_MAX_TOKENS", "900"))
 NVIDIA_MODEL      = os.getenv("NVIDIA_MODEL")      or "nvidia/nemotron-3-super-120b-a12b"
 NVIDIA_PLAN_MODEL = os.getenv("NVIDIA_PLAN_MODEL") or NVIDIA_MODEL
 NVIDIA_CODE_MODEL = os.getenv("NVIDIA_CODE_MODEL") or NVIDIA_MODEL
+# Vision needs a model that can actually SEE. The vision chain used to fall back
+# to NVIDIA carrying the GROQ model id, which NVIDIA answers 404 for — a
+# guaranteed failure dressed up as a fallback. This id is in NVIDIA's live
+# catalog and is multimodal.
+NVIDIA_VISION_MODEL = os.getenv("NVIDIA_VISION_MODEL") or "meta/llama-3.2-11b-vision-instruct"
 
 # ── Provider routing per role ─────────────────────────────────────────────────
 # "groq" | "nvidia" | "auto". "auto" prefers NVIDIA when NVIDIA_API_KEY is set

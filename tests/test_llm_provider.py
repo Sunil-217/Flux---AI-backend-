@@ -300,8 +300,8 @@ def test_the_fallback_attempt_asks_for_a_budget_its_model_can_serve():
     assert primary.max_tokens is None
     assert primary.budget(4096) == 4096
     assert fallback.model == lp.FALLBACK_CHAT_MODEL
-    assert fallback.budget(4096) == lp.FALLBACK_MAX_TOKENS
-    assert lp.FALLBACK_MAX_TOKENS < 4096
+    assert fallback.budget(4096) == lp.MODEL_OUTPUT_CAPS[lp.FALLBACK_CHAT_MODEL]
+    assert fallback.budget(4096) < 4096
 
 
 def test_a_budget_cap_never_raises_a_smaller_request():
@@ -329,4 +329,51 @@ def test_the_cap_is_applied_to_the_actual_call(calls):
         lp._call = original
 
     assert sent[0] == (lp.MODEL, 4096)
-    assert sent[-1] == (lp.FALLBACK_CHAT_MODEL, lp.FALLBACK_MAX_TOKENS)
+    assert sent[-1] == (lp.FALLBACK_CHAT_MODEL, lp.MODEL_OUTPUT_CAPS[lp.FALLBACK_CHAT_MODEL])
+
+
+def test_the_sdk_does_not_retry_behind_our_back():
+    """The OpenAI SDK retries twice by default INSIDE one call. That turns each
+    of our attempts into three, multiplies the configured timeout by three, and
+    does it where our classification, logging and breakers cannot see it.
+    Measured: a throttled vision request took 92s against a 30s timeout while
+    the chain still looked like a single attempt."""
+    for name in (lp.GROQ, lp.NVIDIA):
+        client = lp._providers[name].client
+        assert client is not None
+        assert client.max_retries == 0
+
+
+def test_the_vision_fallback_uses_a_model_that_can_see():
+    """The NVIDIA leg of the vision chain used to carry the GROQ model id, which
+    NVIDIA answers 404 for — a guaranteed failure dressed up as a fallback."""
+    chain = plan_attempts("vision")
+    nvidia_leg = [a for a in chain if a.provider == lp.NVIDIA]
+    assert nvidia_leg, "vision should still have a second provider"
+    assert nvidia_leg[0].model == lp.NVIDIA_VISION_MODEL
+    assert nvidia_leg[0].model != lp.VISION_MODEL
+
+
+def test_a_cap_follows_the_model_into_every_role_that_uses_it():
+    """The cap is a property of the MODEL, not of the chain position.
+
+    `qwen/qwen3.8-27b` is simultaneously the fallback, the vision model, the
+    router and the critic. Capping it per-role fixed the fallback and left
+    vision asking for 4,096 on every single image — refused every time.
+    """
+    capped = lp.MODEL_OUTPUT_CAPS
+    assert capped, "expected at least one capped model"
+
+    for role in ("chat", "vision", "critic", "router", "plan", "code"):
+        for attempt in plan_attempts(role):
+            expected = capped.get(attempt.model)
+            assert attempt.budget(4096) == (expected or 4096), (
+                f"{role}/{attempt.model} asked for {attempt.budget(4096)}")
+
+
+def test_output_caps_are_configurable():
+    from app.core.config import _parse_output_caps
+
+    assert _parse_output_caps("a/b=900,c/d=2000") == {"a/b": 900, "c/d": 2000}
+    assert _parse_output_caps("") == {}
+    assert _parse_output_caps("junk,=5,x=notanumber") == {}
