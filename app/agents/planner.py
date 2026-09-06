@@ -139,6 +139,7 @@ def _validate(raw_steps: list, ceiling: str) -> list[SubTask]:
     """
     steps: list[SubTask] = []
     seen_ids: set[int] = set()
+    seen_work: set[tuple[str, str]] = set()
 
     for item in raw_steps or []:
         if len(steps) >= MAX_PLAN_STEPS:
@@ -150,6 +151,15 @@ def _validate(raw_steps: list, ceiling: str) -> list[SubTask]:
         task = str(item.get("task") or "").strip()
         if agent is None or not task:
             continue
+
+        # The same agent on the same task twice can only produce the same
+        # answer at twice the cost — two web searches, two query embeddings,
+        # two LLM calls, against an 8,000-token minute. The planner is told not
+        # to do this; this makes it impossible rather than discouraged.
+        work = (agent.name, " ".join(task.lower().split()))
+        if work in seen_work:
+            continue
+        seen_work.add(work)
 
         try:
             step_id = int(item.get("id"))

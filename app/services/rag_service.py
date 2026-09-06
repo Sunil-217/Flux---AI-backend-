@@ -466,6 +466,12 @@ def _system_prompt_for(question: str, history: list = None) -> str:
     When in doubt the block is included: a slightly larger prompt costs latency,
     a missing rule costs a wrong answer.
     """
+    # Trimming this further for small talk was tried and reverted. Dropping
+    # ACCURACY_RULE and FORMAT_DEPTH_RULE from a greeting saves ~880 tokens and
+    # removes the two rules that keep a greeting SHORT — the anti-padding clause
+    # ("no 'Certainly!' openers, start with the answer") and the depth
+    # calibration. The cheapest request in the app is the wrong place to spend
+    # answer quality, and test_core_blocks_are_always_present already said so.
     parts = [SYSTEM_BASE, LANGUAGE_CORE]
 
     q = question or ""
@@ -505,7 +511,10 @@ NO_GROUNDED_SOURCE_MESSAGE = (
     "selected. Turn on web search, or upload a document that covers it."
 )
 
-SYSTEM_RAG = (
+# The grounding contract. Never conditional, never abbreviated: these six lines
+# are the whole reason a document answer can be trusted, and they cost ~120
+# tokens. Everything else in the RAG prompt is situational styling.
+RAG_GROUNDING = (
     "You are Close AI, answering questions about the selected document.\n\n"
     "Guidelines:\n"
     "- Use ONLY the supplied document context below. Do not use your pretrained "
@@ -514,7 +523,54 @@ SYSTEM_RAG = (
     "- If the answer is not present in the supplied context, reply exactly: "
     f"\"{DOC_NOT_FOUND_MESSAGE}\"\n"
     "- Interpret technical acronyms in their common technical meaning (e.g. 'RAG' = Retrieval-Augmented Generation).\n"
-    "- Be accurate and clear, with depth calibrated to the question (see ANSWER DEPTH & FORMATTING).\n"
+    "- Be accurate and clear, with depth calibrated to the question (see ANSWER DEPTH & FORMATTING)."
+)
+
+
+def _rag_system_prompt(question: str, history: list = None) -> str:
+    """Assemble the document-Q&A prompt with only the rules this question needs.
+
+    SYSTEM_NORMAL was made conditional when the 8,000 tokens/minute ceiling was
+    first measured; the RAG prompt was left monolithic and kept paying for every
+    rule on every document question — the code rules, the maths rules, the
+    diagram rules and the recency rules, whether or not the question was about
+    code, maths, diagrams or dates. Measured at ~2,937 tokens on every turn.
+
+    The grounding contract above is ALWAYS included, in full. What varies is
+    styling: how to format, how deep to go, which language to mirror. Trading a
+    grounding line for tokens would buy a smaller prompt with a worse answer,
+    which is the wrong trade at any price.
+    """
+    parts = [RAG_GROUNDING, LANGUAGE_CORE]
+
+    q = question or ""
+    recent = " ".join(str(m.get("content", ""))[:400] for m in (history or [])[-4:])
+    if _looks_romanised_indic(q) or _looks_romanised_indic(recent):
+        parts.append(REGIONAL_GLOSSARY)
+
+    parts += [INSTRUCTION_FOLLOWING_RULE, ACCURACY_RULE]
+
+    if _might_need_fresh_info(q):
+        parts.append(TEMPORAL_RULE)
+    if _CODE_HINT.search(q):
+        parts.append(CODE_RULE)
+    if _MATH_HINT.search(q):
+        parts.append(MATH_RULE)
+
+    parts.append(FORMAT_DEPTH_RULE)
+
+    if _DIAGRAM_HINT.search(q):
+        parts.append(DIAGRAM_RULE)
+
+    parts.append("Document Context:\n{context}")
+    return "\n\n".join(parts)
+
+
+# Kept as the full, unconditional prompt: several tests and the KB widget path
+# read it directly, and it is the reference for what the assembled version must
+# always contain.
+SYSTEM_RAG = (
+    RAG_GROUNDING + "\n"
     "- " + LANGUAGE_RULE + "\n\n"
     + INSTRUCTION_FOLLOWING_RULE + "\n\n"
     + ACCURACY_RULE + "\n\n"
@@ -1260,7 +1316,12 @@ def _rag_chat(collection, question: str, history: list = [], chat_id: str = None
 
     context, sources = _retrieve_relevant(collection, question)
 
-    rag_system = SYSTEM_RAG.replace("{context}", context)
+    # Same conditional assembly as the streaming path. This one serves the
+    # embeddable widget and the Telegram bridge, which are exactly the callers
+    # least able to spare quota — a widget on someone else's site answers
+    # strangers, and every one of those turns was carrying the code, maths and
+    # diagram rulebooks whether or not the question needed them.
+    rag_system = _rag_system_prompt(question, history).replace("{context}", context)
     rag_system = _ground_prompt(rag_system, question, history, chat_id)
 
     messages = [{"role": "system", "content": rag_system}]
@@ -1607,7 +1668,8 @@ def stream_question(
                 yield _sse({"type": "sources", "sources": sources})
 
             rag_system = _ground_prompt(
-                SYSTEM_RAG.replace("{context}", context), question, history, chat_id, web_search
+                _rag_system_prompt(question, history).replace("{context}", context),
+                question, history, chat_id, web_search
             ) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": rag_system}]
             messages.extend(history)

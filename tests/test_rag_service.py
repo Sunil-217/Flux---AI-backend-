@@ -606,3 +606,70 @@ def test_full_ruleset_still_contains_every_block():
         rag_service.FORMAT_DEPTH_RULE, rag_service.DIAGRAM_RULE,
     ):
         assert block in rag_service.SYSTEM_NORMAL
+
+
+# ── Document-Q&A prompt: conditional styling, unconditional grounding ────────
+
+def test_the_grounding_contract_is_in_every_rag_prompt_variant():
+    """These lines are the entire reason a document answer can be trusted. They
+    cost ~120 tokens and are never conditional — trading one for a smaller
+    prompt buys a cheaper wrong answer."""
+    for q in ["hi", "what is the price", "pro plan yevlo da", "def foo(): pass",
+              "what is 2+2", "draw a diagram of the flow", "latest revision date"]:
+        p = rag_service._rag_system_prompt(q)
+        assert "ONLY the supplied document context" in p, q
+        assert "Do not infer facts that the context does not support" in p, q
+        assert rag_service.DOC_NOT_FOUND_MESSAGE in p, q
+        assert "{context}" in p, q
+
+
+def test_core_styling_blocks_are_in_every_rag_prompt():
+    for q in ["what is the price", "RAG na enna da", "draw a flowchart"]:
+        p = rag_service._rag_system_prompt(q)
+        assert rag_service.LANGUAGE_CORE in p, q
+        assert rag_service.ACCURACY_RULE in p, q
+        assert rag_service.INSTRUCTION_FOLLOWING_RULE in p, q
+        assert rag_service.FORMAT_DEPTH_RULE in p, q
+
+
+def test_situational_blocks_are_absent_from_a_plain_document_question():
+    """The RAG prompt used to carry every rule on every turn — the code rules,
+    the maths rules, the diagram rules — whether or not the question was about
+    any of them. ~2,937 tokens, on an 8,000-per-minute allowance."""
+    p = rag_service._rag_system_prompt("How much does the Pro plan cost?")
+    assert rag_service.DIAGRAM_RULE not in p
+    assert rag_service.CODE_RULE not in p
+    assert rag_service.MATH_RULE not in p
+    assert rag_service.REGIONAL_GLOSSARY not in p
+
+
+@pytest.mark.parametrize(
+    "question,block",
+    [
+        ("show me the diagram of the login flow", "DIAGRAM_RULE"),
+        ("explain the python function in the doc", "CODE_RULE"),
+        ("what is 2+2 according to the table", "MATH_RULE"),
+        ("what is the current revision", "TEMPORAL_RULE"),
+        ("pro plan yevlo da price", "REGIONAL_GLOSSARY"),
+    ],
+)
+def test_a_situational_block_is_attached_when_the_document_question_calls_for_it(question, block):
+    assert getattr(rag_service, block) in rag_service._rag_system_prompt(question)
+
+
+def test_a_tanglish_follow_up_keeps_the_glossary_from_history():
+    """Someone who opened in Tanglish and follows up with a bare "aprm?" is
+    still in a Tanglish conversation."""
+    history = [{"role": "user", "content": "pro plan pathi sollu da"}]
+    assert rag_service.REGIONAL_GLOSSARY in rag_service._rag_system_prompt("aprm", history)
+
+
+def test_the_assembled_rag_prompt_is_materially_smaller():
+    plain = rag_service._rag_system_prompt("How much does the Pro plan cost?")
+    assert len(plain) < len(rag_service.SYSTEM_RAG) * 0.75
+
+
+def test_the_full_rag_prompt_still_exists_for_the_widget_path():
+    """ask_kb_question and the embeddable widget use SYSTEM_RAG directly."""
+    assert "{context}" in rag_service.SYSTEM_RAG
+    assert rag_service.DOC_NOT_FOUND_MESSAGE in rag_service.SYSTEM_RAG

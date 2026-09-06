@@ -141,14 +141,22 @@ class TaskState:
         every step is how a decomposed plan quietly collapses back into one
         giant prompt — and it would let an early step's content steer a later
         step that was never meant to see it.
+
+        Long outputs keep their head AND their tail. A plain `out[:limit]` hands
+        the next step material that stops mid-sentence, and a step asked to
+        analyse a truncated finding reports the truncation as a gap in the
+        research — the same self-inflicted defect the critic had before
+        `_excerpt` was introduced there.
         """
+        from app.agents.critic import _excerpt
+
         blocks = []
         for dep in sub.depends_on:
             out = self.agent_outputs.get(dep)
             if out:
                 prior = self.step(dep)
                 label = prior.task if prior else f"step {dep}"
-                blocks.append(f"[Result of step {dep} — {label}]\n{out[:limit]}")
+                blocks.append(f"[Result of step {dep} — {label}]\n{_excerpt(out, limit)}")
         return "\n\n".join(blocks)
 
     def to_dict(self) -> dict:

@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import uuid
@@ -57,11 +58,57 @@ def _safe_filename(name: str) -> str:
     return base or "upload.pdf"
 
 
-def _embed_and_store(chat_id: str, safe_chat_id: str, filename: str, chunks: list) -> None:
+def _content_hash(chunks: list) -> str:
+    """Stable fingerprint of a document's extracted text."""
+    h = hashlib.sha256()
+    for chunk in chunks:
+        h.update(chunk.encode("utf-8", "ignore"))
+        h.update(b"\x00")
+    return h.hexdigest()[:32]
+
+
+def _embed_and_store(chat_id: str, safe_chat_id: str, filename: str, chunks: list) -> str:
     """Blocking CPU work (embeddings) + ChromaDB write. Run via a threadpool so
-    it never blocks the async event loop (which would freeze the whole server)."""
-    embeddings = create_embeddings(chunks)
+    it never blocks the async event loop (which would freeze the whole server).
+
+    Re-uploading a file used to embed it again under a fresh id prefix, which
+    cost a full round of embedding quota AND left two near-identical copies of
+    every chunk in the collection — so retrieval returned the same passage twice
+    and crowded out the rest of the document. Now:
+
+      same filename, same content   → reuse what is stored, embed nothing
+      same filename, new content    → drop the old chunks, then embed
+      new filename                  → embed
+
+    Returns "reused", "replaced" or "indexed" so the caller can say which.
+    """
     collection = get_or_create_collection(chat_id)
+    digest = _content_hash(chunks)
+
+    existing_ids: list = []
+    existing_digests: set = set()
+    try:
+        found = collection.get(where={"filename": filename}, include=["metadatas"])
+        existing_ids = list(found.get("ids") or [])
+        existing_digests = {
+            (m or {}).get("content_hash") for m in (found.get("metadatas") or [])
+        }
+    except Exception:
+        # A lookup failure must never block an upload — fall through and index.
+        existing_ids, existing_digests = [], set()
+
+    if existing_ids and existing_digests == {digest}:
+        return "reused"
+
+    if existing_ids:
+        # Replace, don't accumulate. Scoped to this chat's collection and this
+        # filename, so another document in the same chat is untouched.
+        try:
+            collection.delete(ids=existing_ids)
+        except Exception:
+            pass
+
+    embeddings = create_embeddings(chunks)
     # Unique per-upload prefix so a 2nd document's IDs don't collide with the
     # 1st's (which would make Chroma drop them — breaking multiple docs per chat).
     uid = uuid.uuid4().hex[:8]
@@ -70,10 +117,11 @@ def _embed_and_store(chat_id: str, safe_chat_id: str, filename: str, chunks: lis
         embeddings=embeddings,
         ids=[f"{safe_chat_id}_{uid}_{i}" for i in range(len(chunks))],
         metadatas=[
-            {"filename": filename, "chat_id": chat_id}
+            {"filename": filename, "chat_id": chat_id, "content_hash": digest}
             for _ in range(len(chunks))
         ],
     )
+    return "replaced" if existing_ids else "indexed"
 
 
 async def _read_capped(file: UploadFile) -> bytes:
@@ -150,7 +198,9 @@ async def upload_file(
     # Embed + store — offloaded to a thread so the CPU-heavy embedding does NOT
     # block the event loop (which would freeze chat/health for everyone).
     try:
-        await run_in_threadpool(_embed_and_store, chat_id, safe_chat_id, filename, chunks)
+        outcome = await run_in_threadpool(
+            _embed_and_store, chat_id, safe_chat_id, filename, chunks
+        )
     except Exception:
         raise HTTPException(
             status_code=500,
@@ -162,4 +212,7 @@ async def upload_file(
         "chat_id": chat_id,
         "filename": filename,
         "total_chunks": len(chunks),
+        # "indexed" | "replaced" | "reused" — the last means the identical file
+        # was already indexed and no embedding quota was spent.
+        "indexing": outcome,
     }

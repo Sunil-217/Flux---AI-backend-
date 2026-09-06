@@ -465,3 +465,69 @@ def test_every_built_in_tool_is_read_only():
         if tool.name.endswith("_test"):
             continue  # fixtures registered by the tests above
         assert tool.permission == Permission.READ_ONLY, tool.name
+
+
+# ── No duplicated work ───────────────────────────────────────────────────────
+
+def test_the_same_agent_on_the_same_task_is_planned_once(monkeypatch):
+    """Two identical steps can only produce the same answer at twice the cost —
+    two web searches, two query embeddings, two LLM calls, against an
+    8,000-token minute."""
+    _c, steps = _make_plan(monkeypatch, _plan_json([
+        {"id": 1, "agent": "research", "task": "find Notion competitors", "depends_on": []},
+        {"id": 2, "agent": "research", "task": "Find  NOTION   Competitors", "depends_on": []},
+        {"id": 3, "agent": "research", "task": "find their pricing", "depends_on": []},
+        {"id": 4, "agent": "analyse", "task": "compare", "depends_on": [1, 3]},
+    ]))
+    work = [(s.agent, s.task) for s in steps]
+    assert len(work) == 3
+    assert [s.task for s in steps] == ["find Notion competitors", "find their pricing", "compare"]
+
+
+def test_the_same_task_on_a_different_agent_is_kept(monkeypatch):
+    """Dedup is per (agent, task). Asking the documents and the web the same
+    question is two genuinely different answers."""
+    _c, steps = _make_plan(monkeypatch, _plan_json([
+        {"id": 1, "agent": "research", "task": "what are the pricing tiers", "depends_on": []},
+        {"id": 2, "agent": "rag", "task": "what are the pricing tiers", "depends_on": []},
+        {"id": 3, "agent": "analyse", "task": "reconcile", "depends_on": [1, 2]},
+    ]))
+    assert [s.agent for s in steps] == ["research", "rag", "analyse"]
+
+
+def test_a_dependency_on_a_dropped_duplicate_does_not_dangle(monkeypatch):
+    _c, steps = _make_plan(monkeypatch, _plan_json([
+        {"id": 1, "agent": "research", "task": "gather", "depends_on": []},
+        {"id": 2, "agent": "research", "task": "gather", "depends_on": []},
+        {"id": 3, "agent": "analyse", "task": "compare", "depends_on": [1, 2]},
+    ]))
+    kept = {s.id for s in steps}
+    for s in steps:
+        assert all(d in kept for d in s.depends_on), s.depends_on
+
+
+# ── Inter-agent context keeps its ending ─────────────────────────────────────
+
+def test_a_long_step_result_reaches_the_next_step_with_its_ending_intact():
+    """A step asked to analyse a truncated finding reports the truncation as a
+    gap in the research — the same self-inflicted defect the critic had."""
+    st = _state([
+        SubTask(id=1, agent="research", task="gather"),
+        SubTask(id=2, agent="analyse", task="compare", depends_on=[1]),
+    ])
+    st.agent_outputs = {1: ("finding " * 3000) + "CONCLUSION: vendor B is cheapest."}
+
+    ctx = st.dependency_context(st.step(2), limit=2000)
+    assert len(ctx) < len(st.agent_outputs[1])
+    assert ctx.endswith("CONCLUSION: vendor B is cheapest.")
+    assert "excerpt" in ctx
+
+
+def test_a_short_step_result_is_passed_through_whole():
+    st = _state([
+        SubTask(id=1, agent="research", task="gather"),
+        SubTask(id=2, agent="analyse", task="compare", depends_on=[1]),
+    ])
+    st.agent_outputs = {1: "a short complete finding."}
+    assert "a short complete finding." in st.dependency_context(st.step(2))
+    assert "omitted" not in st.dependency_context(st.step(2))
