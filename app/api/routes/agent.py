@@ -104,6 +104,7 @@ async def agent_task(
             web_enabled=web_enabled,
             active_docs=active_docs,
             has_documents=has_documents,
+            user_id=user.id,
         ):
             # The orchestrator asking to delegate is not an answer — run the
             # ordinary path and stream that instead.
@@ -118,6 +119,40 @@ async def agent_task(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/agent/tasks")
+async def list_tasks(
+    limit: int = 20,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """This user's recent agent runs. Scoped to the caller — the query filters
+    on user_id, so there is no id a caller could supply to reach another
+    user's task."""
+    from app.agents.store import list_for_user
+
+    return {"tasks": list_for_user(db, user.id, limit)}
+
+
+@router.get("/agent/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One agent run, including each step's output.
+
+    404 rather than 403 when the task belongs to someone else: a 403 would
+    confirm the id exists, which is itself information the caller should not
+    get from an object they do not own.
+    """
+    from app.agents.store import get as get_task_row
+
+    task = get_task_row(db, user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
 
 
 @router.get("/agent/providers")

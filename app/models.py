@@ -307,3 +307,46 @@ class Plan(Base):
     active = Column(Boolean, nullable=False, default=True)         # hidden from pricing when false
     highlighted = Column(Boolean, nullable=False, default=False)   # "most popular" badge
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AgentTask(Base):
+    """A run of the autonomous orchestration layer, persisted so it survives a
+    process restart.
+
+    Deliberately ONE table in the existing database rather than a job queue.
+    The task is driven by a live streaming request: if the process dies, the
+    client's connection died with it and there is nothing to resume. What is
+    worth keeping is the RECORD — what was planned, what each step produced,
+    why it failed — so the work is inspectable afterwards instead of vanishing.
+    Startup marks anything still non-terminal as interrupted (see main.py), so
+    a task can never appear to be running forever.
+
+    JSON-shaped columns are Text holding a JSON document, matching how
+    UserChats and UserMemory already store structured data here. Everything
+    written goes through the same redaction as working memory — plans and step
+    outputs are built from documents and web pages, and a credential inside one
+    must not reach the database.
+    """
+
+    __tablename__ = "agent_tasks"
+
+    task_id = Column(String, primary_key=True)
+    # Ownership. Every read is filtered on this; a task is never addressable by
+    # id alone, so guessing one gets nothing.
+    user_id = Column(Integer, index=True, nullable=False)
+    chat_id = Column(String, index=True, nullable=True)
+
+    goal = Column(Text, nullable=False, default="")
+    plan = Column(Text, nullable=False, default="[]")            # JSON array of subtasks
+    status = Column(String, nullable=False, default="PLANNING")
+    current_step = Column(Integer, nullable=True)
+
+    agent_outputs = Column(Text, nullable=False, default="{}")   # JSON {step_id: output}
+    tool_outputs = Column(Text, nullable=False, default="{}")    # JSON {tool: output}
+    failures = Column(Text, nullable=False, default="[]")        # JSON array of strings
+    retry_count = Column(Integer, nullable=False, default=0)
+    evaluation = Column(Text, nullable=True)                     # JSON object or NULL
+    final_result = Column(Text, nullable=False, default="")
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)

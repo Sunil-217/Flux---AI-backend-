@@ -21,8 +21,11 @@ Three things this layer owns that the old bare-client code did not:
    the account, not of the request: NVIDIA's `/v1/models` answers 200 for a key
    with no inference entitlement while every inference endpoint answers 403. If
    we merely "tried NVIDIA and fell back" we would pay that round-trip on every
-   single request forever. The first auth/model failure disables that provider
-   (or that one model) for the life of the process, so the cost is paid once.
+   single request forever. An auth failure disables the provider for a window
+   (BREAKER_RETRY_AFTER_SECONDS) rather than permanently, so the cost is one
+   probe every 15 minutes — and the day the entitlement is granted the app
+   picks the provider back up without needing a redeploy. A retired model is
+   condemned on its own; the account it lives on stays usable.
 
 Secrets never appear here in any output. Keys are read from config, held only
 inside the SDK client, and every log line and user-facing message is built from
@@ -43,6 +46,7 @@ from app.core.config import (
     CHAT_PROVIDER,
     CODE_MODEL,
     CODE_PROVIDER,
+    CRITIC_MODEL,
     FALLBACK_CHAT_MODEL,
     GROQ_API_KEY,
     MODEL,
@@ -140,15 +144,29 @@ class AllProvidersFailed(RuntimeError):
 
 # ── Providers ────────────────────────────────────────────────────────────────
 
+# How long a tripped breaker stays open before ONE probe is allowed through.
+#
+# Not permanent, because the failure it guards against is usually temporary in
+# the way that matters: NVIDIA's 403 is an account entitlement, and the day
+# billing is fixed the app should start using NVIDIA without needing a
+# redeploy. Not short either — the point is to stop paying a dead round-trip on
+# every request. One probe per 15 minutes per process is the compromise.
+BREAKER_RETRY_AFTER_SECONDS = 900
+
+
 @dataclass
 class _Provider:
     name: str
     client: Optional[OpenAI]
-    # Models this provider has permanently failed on (retired ids). Guarded by
-    # the module lock; both this and `disabled` are process-local.
+    # Models this provider has failed on permanently (retired ids). Guarded by
+    # the module lock; both this and `disabled_until` are process-local.
     dead_models: set = field(default_factory=set)
-    disabled: bool = False
+    disabled_until: float = 0.0
     disabled_reason: str = ""
+
+    @property
+    def disabled(self) -> bool:
+        return self.disabled_until > time.time()
 
     @property
     def available(self) -> bool:
@@ -181,6 +199,7 @@ def provider_status() -> dict:
                 "configured": p.client is not None,
                 "available": p.available,
                 "disabled_reason": p.disabled_reason,
+                "retry_in_seconds": max(0, int(p.disabled_until - time.time())),
                 "dead_models": sorted(p.dead_models),
             }
             for name, p in _providers.items()
@@ -191,19 +210,25 @@ def reset_breakers() -> None:
     """Re-enable every provider. Used by tests, and safe to call at runtime."""
     with _lock:
         for p in _providers.values():
-            p.disabled = False
+            p.disabled_until = 0.0
             p.disabled_reason = ""
             p.dead_models.clear()
 
 
 def _trip_breaker(provider: str, model: str, kind: str) -> None:
-    """Record a permanent failure so we stop paying for it on every request."""
+    """Stop paying for a known-bad attempt on every request.
+
+    An auth failure opens the whole provider for a while: it is a property of
+    the account, not of this request, so the next request would fail the same
+    way. A retired model condemns that one id — the account is fine and every
+    other model it serves still works.
+    """
     with _lock:
         p = _providers.get(provider)
         if p is None:
             return
         if kind == ErrorKind.AUTH:
-            p.disabled = True
+            p.disabled_until = time.time() + BREAKER_RETRY_AFTER_SECONDS
             p.disabled_reason = "credentials rejected"
         elif kind == ErrorKind.MODEL_UNAVAILABLE:
             p.dead_models.add(model)
@@ -226,6 +251,8 @@ _ROLES: dict[str, tuple[str, str, str]] = {
     "vision":      (VISION_PROVIDER, VISION_MODEL, VISION_MODEL),
     "plan":        (PLANNER_PROVIDER, PLAN_MODEL, NVIDIA_PLAN_MODEL),
     "orchestrate": (ORCHESTRATOR_PROVIDER, PLAN_MODEL, NVIDIA_PLAN_MODEL),
+    # Self-evaluation: a short JSON verdict, not deliberation. See CRITIC_MODEL.
+    "critic":      (ORCHESTRATOR_PROVIDER, CRITIC_MODEL, NVIDIA_PLAN_MODEL),
 }
 
 

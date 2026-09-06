@@ -353,3 +353,50 @@ def test_empty_draft_is_always_a_retry():
 def test_correction_note_names_the_actual_problems():
     note = correction_note(Evaluation(issues=["missing pricing", "no sources"], verdict="retry"))
     assert "missing pricing" in note and "no sources" in note
+
+
+# ── The critic must not manufacture the defect it reports ────────────────────
+
+def test_a_long_draft_keeps_its_ENDING_visible_to_the_critic():
+    """The single largest source of wasted work in this layer was a plain
+    draft[:4000]: the critic saw a copy that stopped mid-sentence and reported
+    "cut off mid-table" — correctly, about the copy. The orchestrator retried,
+    produced a longer draft, and got the same complaint again."""
+    from app.agents.critic import _MAX_DRAFT_CHARS, _excerpt
+
+    draft = ("body " * 6000) + "THE REAL FINAL SENTENCE."
+    out = _excerpt(draft, _MAX_DRAFT_CHARS)
+
+    assert len(out) < len(draft)
+    assert out.endswith("THE REAL FINAL SENTENCE.")
+    assert "excerpt" in out and "NOT a truncated answer" in out
+
+
+def test_a_short_draft_is_passed_through_untouched():
+    from app.agents.critic import _MAX_DRAFT_CHARS, _excerpt
+
+    draft = "a complete short answer."
+    assert _excerpt(draft, _MAX_DRAFT_CHARS) == draft
+    assert _excerpt("", 100) == ""
+
+
+def test_the_critic_prompt_tells_it_an_excerpt_is_not_a_defect():
+    from app.agents.critic import _CRITIC_SYSTEM
+
+    assert "middle omitted" in _CRITIC_SYSTEM
+    assert "do not report it as truncated" in _CRITIC_SYSTEM
+
+
+def test_the_critic_sees_the_end_of_a_real_draft(monkeypatch):
+    """End to end through evaluate(), which is where the bug actually lived."""
+    seen = {}
+    monkeypatch.setattr(
+        "app.agents.critic.complete",
+        lambda role, messages, **k: (
+            seen.update(user=messages[1]["content"]),
+            json.dumps({"complete": True, "grounded": True, "issues": [], "verdict": "pass"}),
+        )[1],
+    )
+    draft = ("filler " * 5000) + "CONCLUSION: use RAG."
+    evaluate(_state([]), draft, "material")
+    assert "CONCLUSION: use RAG." in seen["user"]

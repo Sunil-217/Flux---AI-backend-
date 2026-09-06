@@ -205,3 +205,57 @@ def test_agent_task_accepts_the_same_body_as_chat(client, monkeypatch):
     }
     assert client.post("/agent/task", json=body).status_code == 200
     assert client.post("/chat", json=body).status_code == 200
+
+
+# ── Task ownership (GET /agent/tasks) ────────────────────────────────────────
+
+@pytest.fixture
+def seeded_tasks(app_and_db, monkeypatch):
+    """Two tasks: one owned by user 1 (the authenticated caller), one by user 2."""
+    from app.agents import store
+    from app.agents.state import SubTask, TaskState, TaskStatus
+    from app.db import get_db
+
+    session_factory = app_and_db.app.dependency_overrides[get_db]
+
+    def _factory():
+        gen = session_factory()
+        return next(gen)
+
+    monkeypatch.setattr(store, "SessionLocal", _factory)
+
+    made = {}
+    for uid, key in ((1, "mine"), (2, "theirs")):
+        st = TaskState(user_goal=f"goal for {uid}", chat_id="c1", user_id=uid)
+        st.plan = [SubTask(id=1, agent="research", task="t")]
+        st.agent_outputs = {1: "output"}
+        st.status = TaskStatus.COMPLETED
+        store.save(st, uid)
+        made[key] = st.task_id
+    return made
+
+
+def test_a_user_sees_only_their_own_tasks(client, seeded_tasks):
+    body = client.get("/agent/tasks").json()
+    assert [t["task_id"] for t in body["tasks"]] == [seeded_tasks["mine"]]
+
+
+def test_another_users_task_is_404_not_403(client, seeded_tasks):
+    """403 would confirm the id exists — information the caller should not get
+    from an object they do not own."""
+    assert client.get(f"/agent/tasks/{seeded_tasks['mine']}").status_code == 200
+    assert client.get(f"/agent/tasks/{seeded_tasks['theirs']}").status_code == 404
+    assert client.get("/agent/tasks/does-not-exist").status_code == 404
+
+
+def test_a_task_read_returns_the_full_record(client, seeded_tasks):
+    body = client.get(f"/agent/tasks/{seeded_tasks['mine']}").json()
+    assert body["status"] == "COMPLETED"
+    assert body["plan"][0]["agent"] == "research"
+    assert body["agent_outputs"]["1"] == "output"
+
+
+def test_task_endpoints_require_authentication(app_and_db):
+    c = TestClient(app_and_db.app)
+    assert c.get("/agent/tasks").status_code in (401, 403)
+    assert c.get("/agent/tasks/anything").status_code in (401, 403)

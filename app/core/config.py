@@ -49,6 +49,14 @@ PLAN_MODEL   = os.getenv("PLAN_MODEL")   or "openai/gpt-oss-120b"   # JSON plann
 CODE_MODEL   = os.getenv("CODE_MODEL")   or "openai/gpt-oss-120b"   # code edit / Q&A
 VISION_MODEL = os.getenv("VISION_MODEL") or "qwen/qwen3.8-27b"      # image / screenshot
 ROUTER_MODEL = os.getenv("ROUTER_MODEL") or "qwen/qwen3.8-27b"      # short utility calls
+# The critic emits a small JSON verdict, not prose, so it uses the same
+# non-reasoning model the other short structured calls use. A reasoning model
+# spends completion budget thinking before it writes — invisible tokens that
+# still count against the 8,000/min ceiling, on a call whose whole output is
+# four fields. Measured on four drafts with known-correct verdicts: identical
+# 4/4 judgements, 1121ms -> 376ms average.
+CRITIC_MODEL = os.getenv("CRITIC_MODEL") or "qwen/qwen3.8-27b"
+
 # Second Groq model, tried when the primary errors.
 FALLBACK_CHAT_MODEL = os.getenv("FALLBACK_CHAT_MODEL") or "qwen/qwen3.8-27b"
 
@@ -142,15 +150,49 @@ def _enforce_production_safety() -> None:
             "CORS_ORIGINS must be set to your real frontend URL(s) in production "
             "(currently defaulting to localhost — the backend will be unreachable)."
         )
-    # Guard the key the app actually runs on. This used to require
-    # NVIDIA_API_KEY, which stopped being the chat provider — so a deploy with
-    # no GROQ_API_KEY started cleanly and then failed on every single message,
-    # which is the opposite of failing fast.
+    # Guard the keys the SELECTED CONFIGURATION actually needs. This used to
+    # require NVIDIA_API_KEY, which stopped being the chat provider — so a
+    # deploy with no GROQ_API_KEY started cleanly and then failed on every
+    # single message, which is the opposite of failing fast.
+    #
+    # Groq is required unconditionally: it is the last attempt in EVERY role's
+    # fallback chain (see llm_provider.plan_attempts), so without it a single
+    # NVIDIA outage takes the whole app down. NVIDIA is optional — the app must
+    # never depend on a provider whose account entitlement it does not control.
     if not GROQ_API_KEY:
         problems.append(
-            "GROQ_API_KEY is required — chat, routing, code and vision all run on it. "
+            "GROQ_API_KEY is required — chat, routing, code and vision all run on it, "
+            "and it is the fallback for every other role. "
             "Free key: https://console.groq.com/keys"
         )
+
+    # ...unless NVIDIA has been named explicitly as a role's provider. "auto"
+    # does not count: auto means "use it if it is there", which is exactly the
+    # case where booting without it is correct.
+    explicit_nvidia = [
+        name for name, value in (
+            ("CHAT_PROVIDER", CHAT_PROVIDER), ("ROUTER_PROVIDER", ROUTER_PROVIDER),
+            ("CODE_PROVIDER", CODE_PROVIDER), ("VISION_PROVIDER", VISION_PROVIDER),
+            ("PLANNER_PROVIDER", PLANNER_PROVIDER),
+            ("ORCHESTRATOR_PROVIDER", ORCHESTRATOR_PROVIDER),
+        ) if value == "nvidia"
+    ]
+    if explicit_nvidia and not NVIDIA_API_KEY:
+        problems.append(
+            f"NVIDIA_API_KEY is required because {', '.join(explicit_nvidia)}="
+            "nvidia. Set the key, or use 'auto' (prefer NVIDIA when present, "
+            "fall back to Groq) or 'groq'."
+        )
+
+    # Document Q&A needs an embedding provider. With neither key set, uploads
+    # and retrieval fail at request time while the app reports healthy — the
+    # same silent-failure shape the Groq check above exists to prevent.
+    if not JINA_API_KEY and not NVIDIA_API_KEY:
+        problems.append(
+            "An embedding key is required for document Q&A: set JINA_API_KEY "
+            "(preferred — https://jina.ai/embeddings/) or NVIDIA_API_KEY."
+        )
+
     if problems:
         msg = "\n  - ".join(["Production startup blocked:"] + problems)
         print(msg, file=sys.stderr, flush=True)

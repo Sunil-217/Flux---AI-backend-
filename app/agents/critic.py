@@ -40,6 +40,10 @@ Output ONLY a JSON object, no prose, no markdown fences:
 - verdict: "retry" ONLY if a further attempt could realistically fix the issues.
   Style preferences, extra polish and "could be more detailed" are NOT retry
   reasons — those are "pass".
+
+A block marked "[... middle omitted ...]" is an EXCERPT shown to you to fit a
+size limit. It is not a defect in the work: do not report it as truncated,
+incomplete or cut off, and judge only what you can actually see.
 """
 
 
@@ -56,6 +60,37 @@ def _extract_json(raw: str) -> dict | None:
         return None
 
 
+# Room for a full report plus its sources. Generous on purpose — see _excerpt.
+_MAX_DRAFT_CHARS = 12000
+_MAX_MATERIAL_CHARS = 8000
+
+
+def _excerpt(text: str, limit: int) -> str:
+    """Fit `text` into `limit` WITHOUT hiding how it ends.
+
+    A plain `text[:limit]` was the single largest source of wasted work in this
+    layer. Drafts run past the cap, so the critic was handed a copy that stopped
+    mid-sentence and reported — correctly, about the copy — "the draft is cut
+    off mid-table". The orchestrator then retried, produced a longer draft, and
+    got the same complaint again: three rounds, ~40 seconds, over truncation
+    that the evaluation harness itself was introducing.
+
+    Keeping the head and the tail with an explicit marker means the ending is
+    always visible, and the marker tells the critic the gap is elision rather
+    than a defect in the work.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.6)
+    tail = limit - head
+    return (
+        text[:head]
+        + "\n\n[... middle omitted to fit — this is an excerpt, NOT a truncated answer ...]\n\n"
+        + text[-tail:]
+    )
+
+
 def evaluate(state: TaskState, draft: str, source_material: str) -> Evaluation:
     """Judge a draft. Never raises — every internal failure returns a pass."""
     if not (draft or "").strip():
@@ -64,13 +99,13 @@ def evaluate(state: TaskState, draft: str, source_material: str) -> Evaluation:
 
     user = (
         f"USER GOAL:\n{state.user_goal[:1500]}\n\n"
-        f"SOURCE MATERIAL:\n{(source_material or '(none)')[:4000]}\n\n"
-        f"DRAFT ANSWER:\n{draft[:4000]}"
+        f"SOURCE MATERIAL:\n{_excerpt(source_material, _MAX_MATERIAL_CHARS) or '(none)'}\n\n"
+        f"DRAFT ANSWER:\n{_excerpt(draft, _MAX_DRAFT_CHARS)}"
     )
 
     try:
         raw = complete(
-            "orchestrate",
+            "critic",
             [{"role": "system", "content": _CRITIC_SYSTEM}, {"role": "user", "content": user}],
             temperature=0.0,
             max_tokens=400,

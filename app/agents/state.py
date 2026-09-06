@@ -101,6 +101,9 @@ class TaskState:
     user_goal: str
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     chat_id: str = ""
+    # Owner. Carried on the state so persistence can attribute the row without
+    # every write site having to thread it through; None means "do not persist".
+    user_id: int | None = None
     plan: list[SubTask] = field(default_factory=list)
     current_step: Optional[int] = None
     agent_outputs: dict[int, str] = field(default_factory=dict)

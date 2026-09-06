@@ -1,5 +1,7 @@
 """Provider layer: classification, chain order, fallback, breakers, secrecy."""
 
+import time
+
 import pytest
 
 from app.services import llm_provider as lp
@@ -239,3 +241,46 @@ def test_friendly_error_is_specific_but_leaks_nothing():
     for kind in vars(ErrorKind).values():
         if isinstance(kind, str) and not kind.startswith("_"):
             assert lp.friendly_error(kind).endswith((".", "!"))
+
+
+# ── Breaker recovery ─────────────────────────────────────────────────────────
+
+def test_a_tripped_breaker_reopens_after_its_window(calls, monkeypatch):
+    """The 403 the breaker guards is an account entitlement. The day billing is
+    fixed the app should start using the provider again on its own — a breaker
+    that never reopens would require a redeploy to notice."""
+    monkeypatch.setattr(lp, "BREAKER_RETRY_AFTER_SECONDS", 0.05)
+    calls["script"]["fail"][lp.NVIDIA] = _HttpError(403)
+
+    complete("plan", [{"role": "user", "content": "hi"}])
+    assert lp.provider_status()[lp.NVIDIA]["available"] is False
+
+    time.sleep(0.06)
+    assert lp.provider_status()[lp.NVIDIA]["available"] is True
+
+    calls["seen"].clear()
+    del calls["script"]["fail"][lp.NVIDIA]
+    complete("plan", [{"role": "user", "content": "hi"}])
+    assert calls["seen"][0][0] == lp.NVIDIA
+
+
+def test_the_window_costs_one_probe_not_one_per_request(calls, monkeypatch):
+    """The whole point is to stop paying a dead round-trip on every request."""
+    monkeypatch.setattr(lp, "BREAKER_RETRY_AFTER_SECONDS", 60)
+    calls["script"]["fail"][lp.NVIDIA] = _HttpError(403)
+
+    for _ in range(5):
+        complete("plan", [{"role": "user", "content": "hi"}])
+
+    assert sum(1 for p, _ in calls["seen"] if p == lp.NVIDIA) == 1
+
+
+def test_status_reports_how_long_until_the_next_probe(calls, monkeypatch):
+    monkeypatch.setattr(lp, "BREAKER_RETRY_AFTER_SECONDS", 900)
+    calls["script"]["fail"][lp.NVIDIA] = _HttpError(403)
+    complete("plan", [{"role": "user", "content": "hi"}])
+
+    st = lp.provider_status()[lp.NVIDIA]
+    assert 0 < st["retry_in_seconds"] <= 900
+    assert st["disabled_reason"] == "credentials rejected"
+    assert lp.provider_status()[lp.GROQ]["retry_in_seconds"] == 0

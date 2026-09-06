@@ -113,9 +113,26 @@ def _seed_plans():
         db.close()
 
 
+def _close_out_interrupted_tasks():
+    """Agent runs the previous process was still executing when it stopped.
+
+    Their SSE clients died with it, so there is nothing to resume — but leaving
+    the rows RUNNING would show tasks that never finish and never fail. Mark
+    them interrupted; the partial step outputs stay readable."""
+    try:
+        from app.agents.store import mark_interrupted_tasks
+
+        n = mark_interrupted_tasks()
+        if n:
+            print(f"Marked {n} interrupted agent task(s) from a previous run.", flush=True)
+    except Exception:
+        pass
+
+
 _ensure_schema()
 _bootstrap_admins()
 _seed_plans()
+_close_out_interrupted_tasks()
 
 # Interactive docs are a development convenience. In production they publish
 # the complete API surface — every admin route, every webhook path, every

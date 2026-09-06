@@ -32,7 +32,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
-from app.agents import memory, registry
+from app.agents import memory, registry, store
 from app.agents.critic import correction_note, evaluate
 from app.agents.planner import make_plan
 from app.agents.state import StepStatus, SubTask, TaskState, TaskStatus
@@ -75,6 +75,12 @@ _DIRECT_IMAGE = re.compile(
 
 def _sse(payload: dict) -> dict:
     return payload
+
+
+def _persist(state: TaskState) -> None:
+    """Checkpoint the task. Never raises — see store.save; a good answer must
+    not be lost because a write failed."""
+    store.save(state, state.user_id)
 
 
 def _status(stage: str, state: TaskState, **extra) -> dict:
@@ -178,6 +184,11 @@ def _execute_plan(state: TaskState):
                           tool=sub.tool, status=sub.status, ms=sub.duration_ms,
                           attempts=sub.attempts)
 
+            # Checkpoint per wave, not per step: a wave is the unit of progress,
+            # and one write per step would multiply DB round-trips for no extra
+            # recoverable detail.
+            _persist(state)
+
             # Dependents of a failed step cannot run honestly.
             failed = {s.id for s in state.plan if s.status == StepStatus.FAILED}
             for s in state.plan:
@@ -202,6 +213,9 @@ Rules:
 - If a step failed or produced nothing, say plainly what could not be determined.
   Do not fill the gap from your own knowledge and do not pretend it succeeded.
 - Keep any source URLs that the step results cited.
+- FINISH. Never stop mid-sentence, mid-table or mid-list. If the material is
+  large, write a shorter answer that is COMPLETE rather than a long one that is
+  cut off — a truncated report is worse than a brief one.
 """
 
 
@@ -221,7 +235,13 @@ def _aggregate(state: TaskState, correction: str = "") -> str:
         "chat",
         [{"role": "system", "content": _AGGREGATOR_SYSTEM}, {"role": "user", "content": user}],
         temperature=0.3,
-        max_tokens=2400,
+        # 4096, matching the streaming chat path. 2400 truncated real reports
+        # mid-table: the model is a reasoning one, so part of the budget goes on
+        # thinking before any output is written. The critic caught it correctly
+        # and asked for a retry — which produced another truncated draft under
+        # the same ceiling, so the loop could never converge and simply spent
+        # the whole retry budget.
+        max_tokens=4096,
         task_id=state.task_id,
     )
 
@@ -253,6 +273,7 @@ def run_task(
     active_docs: list | None = None,
     has_documents: bool = False,
     ceiling: str = Permission.READ_ONLY,
+    user_id: int | None = None,
 ):
     """Generator of event dicts for the autonomous path.
 
@@ -266,6 +287,7 @@ def run_task(
         web_enabled=bool(web_enabled),
         active_docs=list(active_docs or []),
         has_documents=bool(has_documents),
+        user_id=user_id,
     )
     history = history or []
 
@@ -324,6 +346,8 @@ def run_task(
             return
 
         state.plan = steps
+        state.status = TaskStatus.RUNNING
+        _persist(state)
         yield _status("planning", state, plan=[s.to_dict() for s in steps])
 
         # ── Execute ─────────────────────────────────────────────────────────
@@ -331,6 +355,7 @@ def run_task(
 
         if not state.agent_outputs:
             state.status = TaskStatus.FAILED
+            _persist(state)
             log_event("task_end", task_id=state.task_id, status=state.status,
                       ms=state.duration_ms, failures=len(state.failures))
             yield _sse({"type": "error",
@@ -351,6 +376,8 @@ def run_task(
                 draft = _aggregate(state, correction)
             except AllProvidersFailed as exc:
                 state.status = TaskStatus.FAILED
+                state.failures.append(f"aggregation failed ({exc.kind})")
+                _persist(state)
                 yield _sse({"type": "error", "message": friendly_error(exc.kind)})
                 return
 
@@ -380,6 +407,7 @@ def run_task(
 
         state.final_result = draft
         state.status = TaskStatus.COMPLETED
+        _persist(state)
 
         yield from _emit_text(draft)
         yield _sse({"type": "task", "task": state.to_dict()})
@@ -391,5 +419,7 @@ def run_task(
 
     except Exception as exc:  # noqa: BLE001 — the endpoint must never 500 mid-stream
         state.status = TaskStatus.FAILED
+        state.failures.append(f"unexpected error ({exc.__class__.__name__})")
+        _persist(state)
         log_event("task_error", task_id=state.task_id, error=exc.__class__.__name__)
         yield _sse({"type": "error", "message": "Failed to complete that request. Please try again."})
