@@ -358,3 +358,40 @@ def test_a_question_about_images_still_goes_to_chat(client, monkeypatch):
 
     events = _events(_post(client, question="why are diffusion models good at images").text)
     assert [e["type"] for e in events] == ["token", "done"]
+
+
+# ── Cross-user document isolation ────────────────────────────────────────────
+
+def test_another_users_documents_are_unreachable_and_never_queried(client, monkeypatch):
+    """Vector collections are keyed by chat id, and chat ids are generated in
+    the browser — so ownership is the ONLY thing standing between a guessed id
+    and someone else's uploaded documents.
+
+    Asserted as "the vector store is never even opened", not just "404": a check
+    that ran after retrieval would still have read the other user's chunks into
+    memory before deciding to refuse.
+    """
+    import app.api.routes.agent as route
+
+    monkeypatch.setattr(route, "AGENT_ORCHESTRATION_ENABLED", True)
+    monkeypatch.setattr("app.services.chroma_service.get_or_create_collection",
+                        lambda cid: pytest.fail(f"opened the collection for {cid!r}"))
+    monkeypatch.setattr("app.services.rag_service._retrieve_relevant",
+                        lambda *a, **k: pytest.fail("retrieved from an unowned chat"))
+
+    for path in ("/chat", "/agent/task"):
+        r = client.post(path, json={"chat_id": "someone-elses-chat-id",
+                                    "question": "what does the contract say"})
+        assert r.status_code == 404, path
+
+
+def test_ownership_is_checked_against_the_caller_not_the_request(app_and_db):
+    """The chat is owned by user 1. User 2 presenting the same id gets nothing."""
+    from app.core.security import get_current_user
+
+    app_and_db.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=2, name="Other", email="other@example.com"
+    )
+    other = TestClient(app_and_db.app)
+    assert other.post("/chat", json={"chat_id": "c1", "question": "hi"}).status_code == 404
+    assert other.post("/agent/task", json={"chat_id": "c1", "question": "hi"}).status_code == 404

@@ -377,3 +377,47 @@ def test_output_caps_are_configurable():
     assert _parse_output_caps("a/b=900,c/d=2000") == {"a/b": 900, "c/d": 2000}
     assert _parse_output_caps("") == {}
     assert _parse_output_caps("junk,=5,x=notanumber") == {}
+
+
+# ── Groq alone is enough ─────────────────────────────────────────────────────
+
+def test_the_app_keeps_working_with_nvidia_permanently_dead(calls):
+    """The deployment must never depend on a provider whose account entitlement
+    it does not control — NVIDIA inference is 403 on this very account."""
+    calls["script"]["fail"][lp.NVIDIA] = _HttpError(403)
+    calls["script"]["text"] = "answered anyway"
+
+    for role in ("chat", "plan", "code", "critic", "router", "orchestrate"):
+        assert complete(role, [{"role": "user", "content": "hi"}]) == "answered anyway"
+
+    assert lp.provider_status()[lp.NVIDIA]["available"] is False
+    assert lp.provider_status()[lp.GROQ]["available"] is True
+    # One probe, not one per role.
+    assert sum(1 for p, _ in calls["seen"] if p == lp.NVIDIA) == 1
+
+
+def test_no_retry_storm_when_everything_is_rate_limited(calls):
+    """A 429 on every provider must cost a bounded number of calls, not a
+    growing one — on a tier with 8,000 tokens/minute a retry storm is how you
+    turn a slow minute into an outage."""
+    calls["script"]["fail"][lp.GROQ] = _HttpError(429)
+    calls["script"]["fail"][lp.NVIDIA] = _HttpError(429)
+
+    chain_length = len(plan_attempts("chat"))
+    for _ in range(4):
+        calls["seen"].clear()
+        with pytest.raises(AllProvidersFailed):
+            complete("chat", [{"role": "user", "content": "hi"}])
+        assert len(calls["seen"]) <= chain_length
+
+
+def test_a_rate_limit_does_not_disable_the_provider(calls):
+    """429 is temporary. Tripping the breaker on it would turn a busy minute
+    into fifteen minutes of not even trying."""
+    calls["script"]["fail"][lp.GROQ] = _HttpError(429)
+
+    # NVIDIA is next in the chain and answers, so there is nothing to raise —
+    # the point is what happens to GROQ afterwards.
+    assert complete("chat", [{"role": "user", "content": "hi"}]) == "ok"
+    assert lp.provider_status()[lp.GROQ]["available"] is True
+    assert lp.provider_status()[lp.GROQ]["retry_in_seconds"] == 0

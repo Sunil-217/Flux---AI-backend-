@@ -313,3 +313,65 @@ def test_different_criticism_each_round_still_uses_the_budget(monkeypatch):
 
     _events(goal="Research the market, compare vendors and write a full report")
     assert len(rounds) == MAX_AGENT_RETRIES + 1
+
+
+# ── Rate-limit exhaustion must never become a fabricated answer ──────────────
+
+def test_total_provider_exhaustion_reports_instead_of_inventing(monkeypatch):
+    """Groq free tier is 8,000 tokens/minute and 200,000/day, and one agent task
+    costs ~10,800. Running out is a NORMAL operating condition here, not an
+    edge case — and the one outcome that must never follow from it is a
+    confident answer the model made up because no source was reachable."""
+    from app.services.llm_provider import AllProvidersFailed, ErrorKind
+
+    monkeypatch.setattr(orchestrator, "make_plan", lambda *a, **k: ("complex", [
+        SubTask(id=1, agent="research", task="gather"),
+        SubTask(id=2, agent="analyse", task="compare", depends_on=[1]),
+    ]))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "material", [], ""))
+
+    def rate_limited(*a, **k):
+        raise AllProvidersFailed("chat", ErrorKind.RATE_LIMIT, None)
+
+    monkeypatch.setattr(orchestrator, "_aggregate", rate_limited)
+
+    events = _events(goal="Research the market, compare vendors and write a full report")
+
+    assert _text(events) == ""                      # no invented answer
+    assert _types(events)[-1] == "error"
+    assert "rate-limited" in events[-1]["message"]  # and it says why
+
+
+def test_a_rate_limited_step_is_reported_as_a_gap_not_filled_in(monkeypatch):
+    """A step that produced nothing must reach the final answer as a stated gap.
+    Quietly substituting model knowledge is how a half-failed research task
+    starts reading like a complete one."""
+    from app.services.llm_provider import ErrorKind
+
+    monkeypatch.setattr(orchestrator, "make_plan", lambda *a, **k: ("complex", [
+        SubTask(id=1, agent="research", task="find competitor pricing"),
+        SubTask(id=2, agent="research", task="find competitor features"),
+    ]))
+
+    def half_fail(st, sub):
+        # _run_step classifies and RETURNS; it never raises to its caller, so a
+        # single failing step cannot take the task down with it.
+        if sub.id == 1:
+            return sub.id, "", [], f"provider unavailable ({ErrorKind.RATE_LIMIT})"
+        return sub.id, "features: A, B", [], ""
+
+    monkeypatch.setattr(orchestrator, "_run_step", half_fail)
+
+    seen = {}
+    monkeypatch.setattr(orchestrator, "_aggregate",
+                        lambda st, corr="": (seen.update(prompt=orchestrator._AGGREGATOR_SYSTEM,
+                                                         failures=list(st.failures)), "answer")[1])
+    monkeypatch.setattr("app.agents.critic.complete",
+                        lambda *a, **k: json.dumps({"complete": True, "grounded": True,
+                                                    "issues": [], "verdict": "pass"}))
+
+    _events(goal="Research the market, compare vendors and write a full report")
+
+    assert seen["failures"], "a failed step must be recorded on the task state"
+    assert "say plainly what could not be determined" in seen["prompt"]
+    assert "do not pretend it succeeded" in seen["prompt"].lower()
