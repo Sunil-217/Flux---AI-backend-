@@ -523,3 +523,78 @@ def test_document_mode_is_unaffected_by_the_web_off_guard(fake_llm, fake_collect
     tokens = [e["content"] for e in events if e["type"] == "token"]
     assert tokens == [rag_service.DOC_NOT_FOUND_MESSAGE]
     assert not [c for c in fake_llm["calls"] if c.get("stream")]
+
+
+# ── Per-question system prompt assembly ──────────────────────────────────────
+# The full ruleset is ~3,200 tokens against a free-tier budget of 8,000 tokens
+# per minute, so sending all of it on every message was most of the reason the
+# app felt slow. These pin which blocks are situational and which are not.
+
+def _tok(s):
+    return len(s) // 4
+
+
+def test_situational_blocks_are_absent_from_a_plain_question():
+    p = rag_service._system_prompt_for("What is RAG?")
+    assert rag_service.DIAGRAM_RULE not in p
+    assert rag_service.CODE_RULE not in p
+    assert rag_service.MATH_RULE not in p
+    assert rag_service.TEMPORAL_RULE not in p
+    assert rag_service.REGIONAL_GLOSSARY not in p
+
+
+def test_core_blocks_are_always_present():
+    """Identity, language mirroring, accuracy, instruction following and answer
+    depth apply to every reply — trimming must never reach these."""
+    for q in ["hi", "What is RAG?", "draw a flowchart", "RAG na enna da"]:
+        p = rag_service._system_prompt_for(q)
+        assert rag_service.SYSTEM_BASE in p, q
+        assert rag_service.LANGUAGE_CORE in p, q
+        assert rag_service.ACCURACY_RULE in p, q
+        assert rag_service.INSTRUCTION_FOLLOWING_RULE in p, q
+        assert rag_service.FORMAT_DEPTH_RULE in p, q
+
+
+@pytest.mark.parametrize(
+    "question,block",
+    [
+        ("draw a flowchart of the login process", "DIAGRAM_RULE"),
+        ("explain closures in javascript", "CODE_RULE"),
+        ("what is 2+2", "MATH_RULE"),
+        ("who is the current CSK captain", "TEMPORAL_RULE"),
+    ],
+)
+def test_situational_block_is_attached_when_the_question_calls_for_it(question, block):
+    assert getattr(rag_service, block) in rag_service._system_prompt_for(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["RAG na enna da", "epdi pannradhu", "code venum da", "mujhe kya karna chahiye",
+     "enti idi", "Vijay image kaatu"],
+)
+def test_glossary_is_attached_for_romanised_indic(question):
+    assert rag_service.REGIONAL_GLOSSARY in rag_service._system_prompt_for(question)
+
+
+def test_glossary_follows_the_conversation_not_just_the_last_message():
+    """Opening in Tanglish then replying "yes" is still a Tanglish conversation."""
+    history = [{"role": "user", "content": "epdi oru API build pannradhu"}]
+    p = rag_service._system_prompt_for("yes", history)
+    assert rag_service.REGIONAL_GLOSSARY in p
+
+
+def test_trimming_actually_saves_a_meaningful_share_of_the_budget():
+    plain = rag_service._system_prompt_for("What is RAG?")
+    assert _tok(plain) < _tok(rag_service.SYSTEM_NORMAL) * 0.6
+
+
+def test_full_ruleset_still_contains_every_block():
+    """SYSTEM_NORMAL remains the complete set for callers with no question."""
+    for block in (
+        rag_service.SYSTEM_BASE, rag_service.LANGUAGE_CORE, rag_service.REGIONAL_GLOSSARY,
+        rag_service.INSTRUCTION_FOLLOWING_RULE, rag_service.ACCURACY_RULE,
+        rag_service.TEMPORAL_RULE, rag_service.CODE_RULE, rag_service.MATH_RULE,
+        rag_service.FORMAT_DEPTH_RULE, rag_service.DIAGRAM_RULE,
+    ):
+        assert block in rag_service.SYSTEM_NORMAL
