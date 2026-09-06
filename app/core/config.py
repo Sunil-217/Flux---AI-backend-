@@ -37,6 +37,61 @@ FLUXWAY_SECRET_TOKEN = os.getenv("FLUXWAY_SECRET_TOKEN") or ""
 FLUXWAY_PSP_FLOW_TYPE = os.getenv("FLUXWAY_PSP_FLOW_TYPE") or "PSP"
 FLUXWAY_TIMEOUT = int(os.getenv("FLUXWAY_TIMEOUT", "20"))  # seconds
 
+# ── LLM models ────────────────────────────────────────────────────────────────
+# Every model id is env-overridable. The defaults are the ones proven in
+# production; see the routing note in rag_service for why the short utility
+# calls use a non-reasoning model. Change a model without a redeploy of code by
+# setting the matching variable.
+#
+# Groq — the primary provider. Everything works with only GROQ_API_KEY set.
+MODEL        = os.getenv("MODEL")        or "openai/gpt-oss-120b"   # chat / RAG
+PLAN_MODEL   = os.getenv("PLAN_MODEL")   or "openai/gpt-oss-120b"   # JSON planning
+CODE_MODEL   = os.getenv("CODE_MODEL")   or "openai/gpt-oss-120b"   # code edit / Q&A
+VISION_MODEL = os.getenv("VISION_MODEL") or "qwen/qwen3.8-27b"      # image / screenshot
+ROUTER_MODEL = os.getenv("ROUTER_MODEL") or "qwen/qwen3.8-27b"      # short utility calls
+# Second Groq model, tried when the primary errors.
+FALLBACK_CHAT_MODEL = os.getenv("FALLBACK_CHAT_MODEL") or "qwen/qwen3.8-27b"
+
+# NVIDIA NIM — optional secondary provider (https://build.nvidia.com).
+# Picked for agentic reasoning and planning rather than by name recognition:
+# Nemotron is NVIDIA's own instruction/reasoning line and `-super-120b-a12b` is
+# a mixture-of-experts checkpoint (≈12B active of 120B total), so it reasons at
+# large-model quality without large-model latency. NVIDIA_MODEL overrides it.
+# `meta/llama-3.3-70b-instruct` is deliberately NOT a default — it was retired
+# by NVIDIA (410, end of life 2026-08-26) and is absent from the live catalog.
+NVIDIA_MODEL      = os.getenv("NVIDIA_MODEL")      or "nvidia/nemotron-3-super-120b-a12b"
+NVIDIA_PLAN_MODEL = os.getenv("NVIDIA_PLAN_MODEL") or NVIDIA_MODEL
+NVIDIA_CODE_MODEL = os.getenv("NVIDIA_CODE_MODEL") or NVIDIA_MODEL
+
+# ── Provider routing per role ─────────────────────────────────────────────────
+# "groq" | "nvidia" | "auto". "auto" prefers NVIDIA when NVIDIA_API_KEY is set
+# and falls back to Groq; an unset key makes it plain Groq. Every role keeps a
+# fallback chain, so a provider outage degrades instead of failing.
+#
+# Defaults keep the hot path (chat, routing, code) on Groq — it is measurably
+# faster and is what the app is tuned for — and send only the deliberative roles
+# (planning, orchestration) to NVIDIA, which is what an extra provider is worth
+# paying latency for.
+CHAT_PROVIDER         = (os.getenv("CHAT_PROVIDER")         or "groq").lower().strip()
+ROUTER_PROVIDER       = (os.getenv("ROUTER_PROVIDER")       or "groq").lower().strip()
+CODE_PROVIDER         = (os.getenv("CODE_PROVIDER")         or "groq").lower().strip()
+VISION_PROVIDER       = (os.getenv("VISION_PROVIDER")       or "groq").lower().strip()
+PLANNER_PROVIDER      = (os.getenv("PLANNER_PROVIDER")      or "auto").lower().strip()
+ORCHESTRATOR_PROVIDER = (os.getenv("ORCHESTRATOR_PROVIDER") or "auto").lower().strip()
+
+# ── Autonomous orchestration limits ───────────────────────────────────────────
+# Bounds on the agent loop. Every one of these exists to make runaway behaviour
+# impossible rather than unlikely: without them a critic that is never satisfied
+# retries forever and a plan that decomposes itself fans out without limit.
+MAX_AGENT_RETRIES  = int(os.getenv("MAX_AGENT_RETRIES", "2"))   # per task, after the first try
+MAX_PLAN_STEPS     = int(os.getenv("MAX_PLAN_STEPS", "8"))      # hard cap on decomposition
+MAX_PARALLEL_STEPS = int(os.getenv("MAX_PARALLEL_STEPS", "4"))  # concurrent agent workers
+AGENT_STEP_TIMEOUT = int(os.getenv("AGENT_STEP_TIMEOUT", "90")) # seconds per step
+# Turn the autonomous path off entirely without a redeploy.
+AGENT_ORCHESTRATION_ENABLED = (
+    os.getenv("AGENT_ORCHESTRATION_ENABLED", "true").lower().strip() not in ("0", "false", "no")
+)
+
 # ── Auth ──
 _DEFAULT_JWT_SECRET = "dev-secret-change-me-in-production"
 JWT_SECRET = os.getenv("JWT_SECRET", _DEFAULT_JWT_SECRET)

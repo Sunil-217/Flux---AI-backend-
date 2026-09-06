@@ -15,9 +15,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# ── Dummy key so OpenAI client construction never fails ──
+# ── Dummy keys so OpenAI client construction never fails ──
+# BOTH providers are configured here on purpose: the app supports Groq plus
+# NVIDIA NIM, and a suite that only ever configures one of them cannot exercise
+# the provider chain, the fallback order, or the circuit breakers. The keys are
+# fake and every client is patched below, so no request leaves the machine.
 os.environ.setdefault("NVIDIA_API_KEY", "test-nvidia-key")
-os.environ.setdefault("GROQ_API_KEY", "")
+os.environ.setdefault("GROQ_API_KEY", "test-groq-key")
 
 # ── Use an in-memory DB during tests (never touch the real flux_ai.db file) ──
 os.environ.setdefault("DATABASE_URL", "sqlite://")
@@ -92,6 +96,23 @@ def make_completion(text):
 
 def make_stream(tokens):
     return [_Resp(t, streaming=True) for t in tokens]
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_breakers():
+    """Clear the provider circuit breakers around every test.
+
+    The breakers are process-global by design — a dead key should be paid for
+    once per process, not once per request. That makes them leak across tests:
+    one test simulating a 403 would silently disable a provider for every test
+    that ran after it, and the resulting failures would point anywhere but at
+    the cause.
+    """
+    from app.services.llm_provider import reset_breakers
+
+    reset_breakers()
+    yield
+    reset_breakers()
 
 
 @pytest.fixture
