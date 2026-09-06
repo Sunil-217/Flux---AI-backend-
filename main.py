@@ -233,3 +233,21 @@ start_telegram_bridge()
 @app.get("/")
 def home():
     return {"message": "Close AI Backend Running"}
+
+
+@app.get("/health")
+def health():
+    """Liveness probe — is this process up and serving?
+
+    Deliberately the cheapest endpoint in the app: no auth, no database, no
+    LLM, no embedding, no outbound call, no computation. That is what makes it
+    safe to hit on a schedule, and it is also why it answers "is the process
+    alive", not "is every dependency healthy" — a keep-alive ping that fails
+    because Groq is rate-limited would be worse than useless.
+
+    Render Free spins a service down when idle; an EXTERNAL scheduler calling
+    this every 10-14 minutes reduces how often users pay a cold start. See the
+    Keep-Alive section in README.md — the app does not ping itself, because a
+    process cannot keep itself awake by talking to itself.
+    """
+    return {"status": "ok"}
