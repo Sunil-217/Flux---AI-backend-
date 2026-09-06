@@ -147,7 +147,7 @@ def test_independent_steps_run_concurrently(monkeypatch):
         peak["n"] = max(peak["n"], len(running))
         time.sleep(0.15)
         running.remove(sub.id)
-        return sub.id, f"out {sub.id}", [], ""
+        return sub.id, f"out {sub.id}", [], "", ""
 
     monkeypatch.setattr(orchestrator, "_run_step", slow)
     st = _state([SubTask(id=i, agent="chat", task=f"t{i}") for i in (1, 2, 3)])
@@ -166,7 +166,7 @@ def test_dependent_step_waits_for_its_input(monkeypatch):
 
     def record(state, sub):
         order.append(sub.id)
-        return sub.id, f"out {sub.id}", [], ""
+        return sub.id, f"out {sub.id}", [], "", ""
 
     monkeypatch.setattr(orchestrator, "_run_step", record)
     st = _state([
@@ -182,8 +182,8 @@ def test_a_failed_step_skips_its_dependents_instead_of_feeding_them_nothing(monk
     result — it is a fabricated one."""
     def fail_first(state, sub):
         if sub.id == 1:
-            return 1, "", [], "boom"
-        return sub.id, "ok", [], ""
+            return 1, "", [], "boom", ""
+        return sub.id, "ok", [], "", ""
 
     monkeypatch.setattr(orchestrator, "_run_step", fail_first)
     st = _state([
@@ -202,7 +202,7 @@ def test_a_failed_step_skips_its_dependents_instead_of_feeding_them_nothing(monk
 def test_a_hung_step_is_abandoned_rather_than_hanging_the_task(monkeypatch):
     monkeypatch.setattr(orchestrator, "AGENT_STEP_TIMEOUT", 0.2)
     monkeypatch.setattr(orchestrator, "_run_step",
-                        lambda s, sub: (time.sleep(3), (sub.id, "late", [], ""))[1])
+                        lambda s, sub: (time.sleep(3), (sub.id, "late", [], "", ""))[1])
     st = _state([SubTask(id=1, agent="chat", task="slow")])
 
     started = time.time()

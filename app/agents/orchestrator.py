@@ -77,6 +77,21 @@ def _sse(payload: dict) -> dict:
     return payload
 
 
+def _failure_message(state: TaskState) -> str:
+    """Say WHY nothing could be produced, when every step agrees on the reason.
+
+    On a free tier, "rate-limited, try again in a moment" is actionable and
+    "please try again" is not — the difference between waiting a minute and
+    assuming the feature is broken. Mixed causes fall back to the generic
+    sentence rather than picking one arbitrarily.
+    """
+    kinds = {s.error_kind for s in state.plan
+             if s.status == StepStatus.FAILED and s.error_kind}
+    if len(kinds) == 1:
+        return friendly_error(kinds.pop())
+    return "I couldn't complete any part of that. Please try again."
+
+
 def _persist(state: TaskState) -> None:
     """Checkpoint the task. Never raises — see store.save; a good answer must
     not be lost because a write failed."""
@@ -96,7 +111,7 @@ def _status(stage: str, state: TaskState, **extra) -> dict:
 
 # ── Execution ────────────────────────────────────────────────────────────────
 
-def _run_step(state: TaskState, sub: SubTask) -> tuple[int, str, list, str]:
+def _run_step(state: TaskState, sub: SubTask) -> tuple[int, str, list, str, str]:
     """Execute one step in a worker thread.
 
     Returns a tuple rather than mutating shared state. Workers touching
@@ -106,14 +121,17 @@ def _run_step(state: TaskState, sub: SubTask) -> tuple[int, str, list, str]:
     """
     agent = registry.resolve(sub.agent)
     if agent is None:
-        return sub.id, "", [], f"unknown agent: {sub.agent}"
+        return sub.id, "", [], f"unknown agent: {sub.agent}", ""
     try:
         output, sources = agent.run(state, sub)
-        return sub.id, output or "", sources or [], ""
+        return sub.id, output or "", sources or [], "", ""
     except AllProvidersFailed as exc:
-        return sub.id, "", [], f"provider unavailable ({exc.kind})"
+        # Carry the failure CLASS as well as the sentence. When every step fails
+        # the same way, the reader deserves "we are rate-limited, wait a moment"
+        # rather than a generic "try again" that gives them nothing to act on.
+        return sub.id, "", [], f"provider unavailable ({exc.kind})", exc.kind
     except Exception as exc:  # noqa: BLE001 — one step failing must not kill the task
-        return sub.id, "", [], exc.__class__.__name__
+        return sub.id, "", [], exc.__class__.__name__, ""
 
 
 def _ready_steps(state: TaskState) -> list[SubTask]:
@@ -161,16 +179,17 @@ def _execute_plan(state: TaskState):
             futures = {pool.submit(_run_step, state, s): s for s in wave}
             for future, sub in futures.items():
                 try:
-                    _sid, output, sources, error = future.result(timeout=AGENT_STEP_TIMEOUT)
+                    _sid, output, sources, error, kind = future.result(timeout=AGENT_STEP_TIMEOUT)
                 except FuturesTimeout:
-                    output, sources, error = "", [], "timed out"
+                    output, sources, error, kind = "", [], "timed out", ""
                 except Exception as exc:  # noqa: BLE001
-                    output, sources, error = "", [], exc.__class__.__name__
+                    output, sources, error, kind = "", [], exc.__class__.__name__, ""
 
                 sub.finished_at = time.time()
                 if error or not output.strip():
                     sub.status = StepStatus.FAILED
                     sub.error = error or "produced no output"
+                    sub.error_kind = kind
                     state.failures.append(f"step {sub.id} ({sub.agent}): {sub.error}")
                 else:
                     sub.status = StepStatus.DONE
@@ -330,7 +349,7 @@ def run_task(
         if _DIRECT_IMAGE.match(state.user_goal):
             state.plan = [SubTask(id=1, agent="image", task=state.user_goal)]
             yield _status("image", state)
-            _sid, out, _src, err = _run_step(state, state.plan[0])
+            _sid, out, _src, err, _kind = _run_step(state, state.plan[0])
             if err or not out:
                 yield _sse({"type": "error", "message": "Image generation failed. Please try again."})
                 return
@@ -368,8 +387,7 @@ def run_task(
             _persist(state)
             log_event("task_end", task_id=state.task_id, status=state.status,
                       ms=state.duration_ms, failures=len(state.failures))
-            yield _sse({"type": "error",
-                        "message": "I couldn't complete any part of that. Please try again."})
+            yield _sse({"type": "error", "message": _failure_message(state)})
             return
 
         if state.sources:

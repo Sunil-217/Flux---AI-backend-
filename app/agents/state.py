@@ -54,6 +54,9 @@ class SubTask:
     status: str = StepStatus.PENDING
     output: str = ""
     error: str = ""
+    # Provider failure class (llm_provider.ErrorKind) when the step failed
+    # because no provider could serve it. Empty for every other failure.
+    error_kind: str = ""
     sources: list = field(default_factory=list)
     attempts: int = 0
     started_at: float = 0.0

@@ -335,7 +335,7 @@ def test_a_direct_image_request_reaches_the_image_agent_through_the_route(
 
     monkeypatch.setattr(route, "AGENT_ORCHESTRATION_ENABLED", True)
     monkeypatch.setattr("app.agents.orchestrator._run_step",
-                        lambda st, sub: (sub.id, "data:image/png;base64,AAAA", [], ""))
+                        lambda st, sub: (sub.id, "data:image/png;base64,AAAA", [], "", ""))
     monkeypatch.setattr("app.services.rag_service.stream_question",
                         lambda *a, **k: pytest.fail("an image request must not go to chat"))
 

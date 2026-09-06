@@ -75,7 +75,7 @@ def test_direct_image_requests_short_circuit_to_the_image_agent(monkeypatch, goa
     monkeypatch.setattr(orchestrator, "make_plan",
                         lambda *a, **k: pytest.fail("a direct image request must never be planned"))
     monkeypatch.setattr(orchestrator, "_run_step",
-                        lambda st, sub: (sub.id, "data:image/png;base64,AAAA", [], ""))
+                        lambda st, sub: (sub.id, "data:image/png;base64,AAAA", [], "", ""))
 
     events = _events(goal=goal)
     assert "image" in _types(events)
@@ -91,7 +91,7 @@ def test_a_question_about_images_is_still_answered_as_text(monkeypatch):
 
 
 def test_image_failure_reports_instead_of_inventing_a_reply(monkeypatch):
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "", [], "provider down"))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "", [], "provider down", ""))
     events = _events(goal="draw a picture of a dog")
     assert _types(events) == ["status", "error"]
 
@@ -184,7 +184,7 @@ def test_the_critic_cannot_retry_forever(monkeypatch):
         SubTask(id=1, agent="chat", task="a"),
         SubTask(id=2, agent="chat", task="b", depends_on=[1]),
     ]))
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], ""))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], "", ""))
 
     aggregations = []
     monkeypatch.setattr(orchestrator, "_aggregate",
@@ -210,7 +210,7 @@ def test_a_correction_round_is_told_what_to_fix(monkeypatch):
         SubTask(id=1, agent="chat", task="a"),
         SubTask(id=2, agent="chat", task="b", depends_on=[1]),
     ]))
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], ""))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], "", ""))
 
     corrections = []
     monkeypatch.setattr(orchestrator, "_aggregate",
@@ -236,7 +236,7 @@ def test_a_task_where_every_step_failed_says_so(monkeypatch):
         SubTask(id=1, agent="research", task="a"),
         SubTask(id=2, agent="research", task="b"),
     ]))
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "", [], "provider down"))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "", [], "provider down", ""))
     monkeypatch.setattr(orchestrator, "_aggregate",
                         lambda *a, **k: pytest.fail("must not aggregate nothing into an answer"))
 
@@ -250,7 +250,7 @@ def test_status_events_never_leak_reasoning(monkeypatch):
         SubTask(id=1, agent="research", task="secret internal step description"),
         SubTask(id=2, agent="analyse", task="b", depends_on=[1]),
     ]))
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "out", [], ""))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "out", [], "", ""))
     monkeypatch.setattr(orchestrator, "_aggregate", lambda *a, **k: "final answer")
     monkeypatch.setattr("app.agents.critic.complete",
                         lambda *a, **k: json.dumps({"complete": True, "grounded": True,
@@ -271,7 +271,7 @@ def test_a_retry_that_changes_nothing_stops_early(monkeypatch):
         SubTask(id=1, agent="chat", task="a"),
         SubTask(id=2, agent="chat", task="b", depends_on=[1]),
     ]))
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], ""))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], "", ""))
 
     rounds = []
     monkeypatch.setattr(orchestrator, "_aggregate",
@@ -298,7 +298,7 @@ def test_different_criticism_each_round_still_uses_the_budget(monkeypatch):
         SubTask(id=1, agent="chat", task="a"),
         SubTask(id=2, agent="chat", task="b", depends_on=[1]),
     ]))
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], ""))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, f"out{sub.id}", [], "", ""))
 
     rounds = []
     monkeypatch.setattr(orchestrator, "_aggregate",
@@ -328,7 +328,7 @@ def test_total_provider_exhaustion_reports_instead_of_inventing(monkeypatch):
         SubTask(id=1, agent="research", task="gather"),
         SubTask(id=2, agent="analyse", task="compare", depends_on=[1]),
     ]))
-    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "material", [], ""))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (sub.id, "material", [], "", ""))
 
     def rate_limited(*a, **k):
         raise AllProvidersFailed("chat", ErrorKind.RATE_LIMIT, None)
@@ -357,8 +357,8 @@ def test_a_rate_limited_step_is_reported_as_a_gap_not_filled_in(monkeypatch):
         # _run_step classifies and RETURNS; it never raises to its caller, so a
         # single failing step cannot take the task down with it.
         if sub.id == 1:
-            return sub.id, "", [], f"provider unavailable ({ErrorKind.RATE_LIMIT})"
-        return sub.id, "features: A, B", [], ""
+            return sub.id, "", [], f"provider unavailable ({ErrorKind.RATE_LIMIT})", ErrorKind.RATE_LIMIT
+        return sub.id, "features: A, B", [], "", ""
 
     monkeypatch.setattr(orchestrator, "_run_step", half_fail)
 
@@ -375,3 +375,54 @@ def test_a_rate_limited_step_is_reported_as_a_gap_not_filled_in(monkeypatch):
     assert seen["failures"], "a failed step must be recorded on the task state"
     assert "say plainly what could not be determined" in seen["prompt"]
     assert "do not pretend it succeeded" in seen["prompt"].lower()
+
+
+def test_a_uniformly_rate_limited_task_says_so(monkeypatch):
+    """On a free tier, "rate-limited, try again in a moment" is actionable and
+    "please try again" is not — the difference between waiting a minute and
+    concluding the feature is broken."""
+    from app.services.llm_provider import ErrorKind
+
+    monkeypatch.setattr(orchestrator, "make_plan", lambda *a, **k: ("complex", [
+        SubTask(id=1, agent="research", task="a"),
+        SubTask(id=2, agent="research", task="b"),
+    ]))
+    monkeypatch.setattr(orchestrator, "_run_step", lambda st, sub: (
+        sub.id, "", [], f"provider unavailable ({ErrorKind.RATE_LIMIT})", ErrorKind.RATE_LIMIT))
+
+    events = _events(goal="Research the market, compare vendors and write a full report")
+    assert _types(events)[-1] == "error"
+    assert "rate-limited" in events[-1]["message"]
+
+
+def test_mixed_failure_causes_stay_generic(monkeypatch):
+    """Picking one cause out of several would be a guess presented as a fact."""
+    from app.services.llm_provider import ErrorKind
+
+    monkeypatch.setattr(orchestrator, "make_plan", lambda *a, **k: ("complex", [
+        SubTask(id=1, agent="research", task="a"),
+        SubTask(id=2, agent="research", task="b"),
+    ]))
+
+    def mixed(st, sub):
+        if sub.id == 1:
+            return sub.id, "", [], "rate limited", ErrorKind.RATE_LIMIT
+        return sub.id, "", [], "timed out", ErrorKind.TIMEOUT
+
+    monkeypatch.setattr(orchestrator, "_run_step", mixed)
+
+    events = _events(goal="Research the market, compare vendors and write a full report")
+    assert events[-1]["message"] == "I couldn't complete any part of that. Please try again."
+
+
+def test_a_non_provider_failure_stays_generic(monkeypatch):
+    """A crashed agent is not a provider outage and must not be reported as one."""
+    monkeypatch.setattr(orchestrator, "make_plan", lambda *a, **k: ("complex", [
+        SubTask(id=1, agent="research", task="a"),
+        SubTask(id=2, agent="research", task="b"),
+    ]))
+    monkeypatch.setattr(orchestrator, "_run_step",
+                        lambda st, sub: (sub.id, "", [], "ValueError", ""))
+
+    events = _events(goal="Research the market, compare vendors and write a full report")
+    assert events[-1]["message"] == "I couldn't complete any part of that. Please try again."
