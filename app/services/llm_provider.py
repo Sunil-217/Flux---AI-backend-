@@ -48,6 +48,7 @@ from app.core.config import (
     CODE_PROVIDER,
     CRITIC_MODEL,
     FALLBACK_CHAT_MODEL,
+    FALLBACK_MAX_TOKENS,
     GROQ_API_KEY,
     MODEL,
     NVIDIA_API_KEY,
@@ -240,6 +241,13 @@ def _trip_breaker(provider: str, model: str, kind: str) -> None:
 class Attempt:
     provider: str
     model: str
+    # Caps this attempt's output budget below whatever the caller asked for.
+    # Set on the fallback attempt, whose model has a much smaller per-minute
+    # output allowance than the primary — see FALLBACK_MAX_TOKENS.
+    max_tokens: Optional[int] = None
+
+    def budget(self, requested: int) -> int:
+        return min(requested, self.max_tokens) if self.max_tokens else requested
 
 
 # role -> (preference, groq model, nvidia model). The preference string is the
@@ -293,8 +301,9 @@ def plan_attempts(role: str, model_override: Optional[str] = None) -> list[Attem
         if role != "vision":
             g = _providers[GROQ]
             if g.available and FALLBACK_CHAT_MODEL not in g.dead_models:
-                extra = Attempt(GROQ, FALLBACK_CHAT_MODEL)
-                if extra not in attempts:
+                extra = Attempt(GROQ, FALLBACK_CHAT_MODEL, max_tokens=FALLBACK_MAX_TOKENS)
+                if not any(a.provider == extra.provider and a.model == extra.model
+                           for a in attempts):
                     attempts.append(extra)
     return attempts
 
@@ -327,7 +336,7 @@ def _call(attempt: Attempt, messages: list, temperature: float, max_tokens: int,
         model=attempt.model,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_tokens=attempt.budget(max_tokens),
         stream=stream,
         **extra,
     )

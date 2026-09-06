@@ -259,3 +259,102 @@ def test_task_endpoints_require_authentication(app_and_db):
     c = TestClient(app_and_db.app)
     assert c.get("/agent/tasks").status_code in (401, 403)
     assert c.get("/agent/tasks/anything").status_code in (401, 403)
+
+
+# ── A vision turn is not an agent task ───────────────────────────────────────
+
+def test_an_image_turn_is_delegated_to_chat_with_the_image_intact(client, monkeypatch):
+    """Without an `image` field Pydantic would drop it silently and the picture
+    would never be looked at — the request would succeed and answer the wrong
+    question."""
+    import app.api.routes.agent as route
+    from app.services import rag_service
+
+    seen = {}
+
+    def fake_stream(chat_id, question, history, image=None, *a):
+        seen["image"] = image
+        yield rag_service._sse({"type": "token", "content": "a cat"})
+
+    monkeypatch.setattr(route, "AGENT_ORCHESTRATION_ENABLED", True)
+    monkeypatch.setattr("app.services.rag_service.stream_question", fake_stream)
+    monkeypatch.setattr("app.agents.orchestrator.run_task",
+                        lambda *a, **k: pytest.fail("a vision turn must never be planned"))
+
+    r = _post(client, question="Research this in detail and compare the options carefully",
+              image="data:image/png;base64,AAAA")
+    assert r.status_code == 200
+    assert seen["image"] == "data:image/png;base64,AAAA"
+
+
+def test_style_and_document_selection_reach_the_delegated_chat(client, monkeypatch):
+    """Delegation must be transparent: the ordinary path has to receive every
+    preference the caller sent, or /agent/task quietly answers differently."""
+    import app.api.routes.agent as route
+    from app.services import rag_service
+
+    seen = {}
+
+    def fake_stream(chat_id, question, history, image, style, ci, web, docs):
+        seen.update(style=style, ci=ci, web=web, docs=docs, history=history)
+        yield rag_service._sse({"type": "token", "content": "ok"})
+
+    monkeypatch.setattr(route, "AGENT_ORCHESTRATION_ENABLED", True)
+    monkeypatch.setattr("app.services.rag_service.stream_question", fake_stream)
+
+    _post(client, question="hi", style="concise", custom_instructions="be brief",
+          web_search=False, active_docs=["a.pdf"],
+          history=[{"role": "user", "content": "earlier"}])
+
+    assert seen["style"] == "concise"
+    assert "be brief" in seen["ci"]
+    assert seen["web"] is False
+    assert seen["docs"] == ["a.pdf"]
+    assert seen["history"] == [{"role": "user", "content": "earlier"}]
+
+
+# ── Direct image intent must survive the ROUTE, not just run_task ────────────
+
+@pytest.mark.parametrize("goal", [
+    "generate an image of a red sports car in the desert",
+    "draw a picture of a cat wearing sunglasses",
+    "make me a logo for a coffee shop",
+])
+def test_a_direct_image_request_reaches_the_image_agent_through_the_route(
+    client, monkeypatch, goal
+):
+    """Asserted end to end through /agent/task on purpose.
+
+    These requests are short and keyword-free, so the route's cheap triage
+    called them "simple" and delegated them to ordinary chat — which has no
+    image generation and answers in prose. The orchestrator's image
+    short-circuit was covered by a test that called run_task directly, so the
+    unit passed while the wiring did not.
+    """
+    import app.api.routes.agent as route
+
+    monkeypatch.setattr(route, "AGENT_ORCHESTRATION_ENABLED", True)
+    monkeypatch.setattr("app.agents.orchestrator._run_step",
+                        lambda st, sub: (sub.id, "data:image/png;base64,AAAA", [], ""))
+    monkeypatch.setattr("app.services.rag_service.stream_question",
+                        lambda *a, **k: pytest.fail("an image request must not go to chat"))
+
+    events = _events(_post(client, question=goal).text)
+    kinds = [e["type"] for e in events]
+    assert "image" in kinds
+    assert "token" not in kinds       # a picture, not prose about pictures
+
+
+def test_a_question_about_images_still_goes_to_chat(client, monkeypatch):
+    """The exception is for REQUESTS for a picture, not for talking about them."""
+    import app.api.routes.agent as route
+    from app.services import rag_service
+
+    monkeypatch.setattr(route, "AGENT_ORCHESTRATION_ENABLED", True)
+    monkeypatch.setattr("app.services.rag_service.stream_question",
+                        lambda *a, **k: iter([rag_service._sse({"type": "token", "content": "prose"})]))
+    monkeypatch.setattr("app.agents.orchestrator.run_task",
+                        lambda *a, **k: pytest.fail("this is a question, not an image request"))
+
+    events = _events(_post(client, question="why are diffusion models good at images").text)
+    assert [e["type"] for e in events] == ["token", "done"]

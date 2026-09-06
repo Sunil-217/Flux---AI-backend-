@@ -260,7 +260,17 @@ def should_orchestrate(goal: str) -> bool:
 
     Mirrors the planner's triage: anything the planner would call simple should
     never have paid for an import, a state object and a status event.
+
+    A direct image request is the exception. "draw a picture of a cat" is short
+    and simple by every length and keyword measure, so triage called it simple
+    and the caller delegated it to ordinary chat — which has no image
+    generation and answers in prose. That made run_task's image short-circuit
+    unreachable in practice: it was covered by a test that called run_task
+    directly, so the unit passed while the wiring did not.
     """
+    if _DIRECT_IMAGE.match(goal or ""):
+        return True
+
     from app.agents.planner import _fast_triage
     return _fast_triage(goal) != "simple"
 

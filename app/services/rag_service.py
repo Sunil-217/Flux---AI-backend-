@@ -713,7 +713,7 @@ def _chat_complete(messages: list, temperature: float = 0.3, max_tokens: int = 1
                 model=attempt.model,
                 messages=messages,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=attempt.budget(max_tokens),
             )
             out = (resp.choices[0].message.content or "").strip()
             if out:
@@ -1388,7 +1388,7 @@ def _chat_stream_attempts(model: str):
     """
     role = "vision" if model == VISION_MODEL else "chat"
     attempts = [
-        (llm_provider._providers[a.provider].client, a.model, a.provider)
+        (llm_provider._providers[a.provider].client, a.model, a.provider, a)
         for a in plan_attempts(role, model_override=model)
     ]
     if attempts:
@@ -1398,7 +1398,7 @@ def _chat_stream_attempts(model: str):
     # exists so the caller still gets a real error from a real call rather than
     # an empty chain it has to special-case.
     c = _groq_or_nvidia()
-    return [(c, model, "direct")] if c is not None else []
+    return [(c, model, "direct", None)] if c is not None else []
 
 
 def _log_stream_start_error(provider: str, model: str, exc: Exception) -> None:
@@ -1435,13 +1435,17 @@ def _stream_completion(messages: list, temperature: float, model: str = MODEL):
     """
     stream = None
     last_exc = None
-    for attempt_client, attempt_model, provider in _chat_stream_attempts(model):
+    for attempt_client, attempt_model, provider, attempt in _chat_stream_attempts(model):
         try:
             stream = attempt_client.chat.completions.create(
                 model=attempt_model,
                 messages=messages,
                 temperature=temperature,
-                max_tokens=4096,
+                # The fallback model's per-minute OUTPUT allowance is far smaller
+                # than the primary's, so asking it for 4096 is refused outright
+                # rather than merely queued. Each attempt gets a budget it can
+                # actually serve.
+                max_tokens=attempt.budget(4096) if attempt is not None else 4096,
                 stream=True,
             )
             break

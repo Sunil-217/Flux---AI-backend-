@@ -59,6 +59,17 @@ CRITIC_MODEL = os.getenv("CRITIC_MODEL") or "qwen/qwen3.8-27b"
 
 # Second Groq model, tried when the primary errors.
 FALLBACK_CHAT_MODEL = os.getenv("FALLBACK_CHAT_MODEL") or "qwen/qwen3.8-27b"
+# Output budget for the FALLBACK attempt only.
+#
+# Measured against the live account: this model carries an output-tokens-per-
+# minute cap of 1,000, so asking it for the normal 4,096 is refused outright —
+#   "Request too large ... on output tokens per minute (OTPM): Limit 1000,
+#    Requested 1040 ... reduce max_tokens"
+# — every single time, whatever the remaining budget. The fallback was therefore
+# structurally incapable of ever answering: it existed, it was tried, and it
+# always 429'd. A shorter answer from the backup model is the entire point of
+# having one; a guaranteed failure is not. Raise this on a paid tier.
+FALLBACK_MAX_TOKENS = int(os.getenv("FALLBACK_MAX_TOKENS", "900"))
 
 # NVIDIA NIM — optional secondary provider (https://build.nvidia.com).
 # Picked for agentic reasoning and planning rather than by name recognition:

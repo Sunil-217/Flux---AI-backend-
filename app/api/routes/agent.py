@@ -41,6 +41,10 @@ class AgentTaskRequest(BaseModel):
     # Same field name as ChatRequest so a client can post the same body here.
     question: str = Field(..., min_length=1, max_length=8000)
     history: Optional[List[HistoryMessage]] = []
+    # Accepted so a client can post the /chat body verbatim. A vision turn is
+    # not an agent task and is delegated below — without this field Pydantic
+    # would drop it silently and the image would simply never be looked at.
+    image: Optional[str] = None
     style: Optional[str] = None
     custom_instructions: Optional[str] = None
     web_search: Optional[bool] = True
@@ -73,7 +77,7 @@ async def agent_task(
         from app.services.rag_service import stream_question
 
         yield from stream_question(
-            request.chat_id, request.question, history, None,
+            request.chat_id, request.question, history, request.image,
             request.style, custom_instructions or None, web_enabled, active_docs,
         )
 
@@ -91,8 +95,10 @@ async def agent_task(
         except Exception:
             has_documents = False
 
-        # Cheap triage first: a simple message never pays for the agent stack.
-        if not should_orchestrate(request.question):
+        # A vision turn goes straight to chat: the orchestrator has no image in
+        # its plan model, and routing one here would lose the picture entirely.
+        # Cheap triage otherwise — a simple message never pays for the agent stack.
+        if request.image or not should_orchestrate(request.question):
             yield from _fallback_chat()
             yield _sse({"type": "done"})
             return

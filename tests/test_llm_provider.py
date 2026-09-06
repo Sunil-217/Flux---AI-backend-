@@ -284,3 +284,49 @@ def test_status_reports_how_long_until_the_next_probe(calls, monkeypatch):
     assert 0 < st["retry_in_seconds"] <= 900
     assert st["disabled_reason"] == "credentials rejected"
     assert lp.provider_status()[lp.GROQ]["retry_in_seconds"] == 0
+
+
+# ── Per-attempt output budget ────────────────────────────────────────────────
+
+def test_the_fallback_attempt_asks_for_a_budget_its_model_can_serve():
+    """Measured against the live account: the fallback model carries an
+    output-tokens-per-minute cap of 1,000, so asking it for the normal 4,096 is
+    refused outright with "Request too large ... reduce max_tokens" — every
+    time, whatever budget remains. The fallback existed, was tried, and could
+    never succeed."""
+    chain = plan_attempts("chat")
+    primary, fallback = chain[0], chain[-1]
+
+    assert primary.max_tokens is None
+    assert primary.budget(4096) == 4096
+    assert fallback.model == lp.FALLBACK_CHAT_MODEL
+    assert fallback.budget(4096) == lp.FALLBACK_MAX_TOKENS
+    assert lp.FALLBACK_MAX_TOKENS < 4096
+
+
+def test_a_budget_cap_never_raises_a_smaller_request():
+    """A cap is a ceiling, not a target — a caller asking for 200 gets 200."""
+    capped = Attempt(lp.GROQ, "m", max_tokens=900)
+    assert capped.budget(200) == 200
+    assert capped.budget(4096) == 900
+
+
+def test_the_cap_is_applied_to_the_actual_call(calls):
+    calls["script"]["fail"][(lp.GROQ, lp.MODEL)] = _HttpError(429)
+    calls["script"]["fail"][(lp.NVIDIA, lp.NVIDIA_MODEL)] = _HttpError(429)
+
+    sent = []
+    original = lp._call
+
+    def spy(attempt, messages, temperature, max_tokens, stream, extra):
+        sent.append((attempt.model, attempt.budget(max_tokens)))
+        return original(attempt, messages, temperature, max_tokens, stream, extra)
+
+    lp._call = spy
+    try:
+        complete("chat", [{"role": "user", "content": "hi"}], max_tokens=4096)
+    finally:
+        lp._call = original
+
+    assert sent[0] == (lp.MODEL, 4096)
+    assert sent[-1] == (lp.FALLBACK_CHAT_MODEL, lp.FALLBACK_MAX_TOKENS)
