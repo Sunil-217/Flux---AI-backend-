@@ -92,8 +92,10 @@ def test_stream_question_rag_emits_sources_first(fake_llm, fake_collection):
     fake_collection.count.return_value = 3
     fake_llm["stream_tokens"] = ["A", "B"]
     events = _parse(rag_service.stream_question("c1", "explain", []))
-    assert events[0]["type"] == "sources"
-    assert len(events[0]["sources"]) == 2
+    # The retrieval status is announced first; sources follow before any token.
+    assert events[0]["type"] == "status"
+    assert events[1]["type"] == "sources"
+    assert len(events[1]["sources"]) == 2
     assert events[-1]["type"] == "done"
     assert [e["type"] for e in events if e["type"] == "token"] == ["token", "token"]
 
@@ -673,3 +675,55 @@ def test_the_full_rag_prompt_still_exists_for_the_widget_path():
     """ask_kb_question and the embeddable widget use SYSTEM_RAG directly."""
     assert "{context}" in rag_service.SYSTEM_RAG
     assert rag_service.DOC_NOT_FOUND_MESSAGE in rag_service.SYSTEM_RAG
+
+
+# ── Stage statuses on the streaming chat path ────────────────────────────────
+# A status the reader sees is a claim about what the system is doing right now.
+# These pin that the claim is only ever made at the moment the work happens, and
+# never when it does not.
+
+
+def test_stream_question_rag_announces_reading_before_sources(fake_llm, fake_collection):
+    fake_collection.count.return_value = 3
+    events = _parse(rag_service.stream_question("c1", "explain", []))
+    assert events[0] == {"type": "status", "label": "Reading your documents", "stage": "rag"}
+    assert events[1]["type"] == "sources"
+    assert events[-1]["type"] == "done"
+
+
+def test_stream_question_normal_emits_no_status_without_a_search(fake_llm, fake_collection):
+    fake_collection.count.return_value = 0
+    events = _parse(rag_service.stream_question("c1", "hi", []))
+    assert not any(e["type"] == "status" for e in events)
+
+
+def test_stream_question_announces_research_only_when_the_router_says_search(
+    monkeypatch, fake_llm, fake_collection
+):
+    fake_collection.count.return_value = 0
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    monkeypatch.setattr(rag_service, "run_web_search", lambda q: "live results")
+
+    fake_llm["router"] = "current CSK captain"
+    events = _parse(rag_service.stream_question("c1", "who is the current CSK captain", []))
+    statuses = [e for e in events if e["type"] == "status"]
+    assert statuses == [{"type": "status", "label": "Researching", "stage": "research"}]
+    # The router decided exactly once for this turn.
+    assert sum(1 for c in fake_llm["calls"] if c.get("model") == rag_service.ROUTER_MODEL) == 1
+
+    # Router says no → no search happens → no claim that one did.
+    fake_llm["router"] = "NO"
+    events = _parse(rag_service.stream_question("c1", "who is the current CSK captain", []))
+    assert not any(e["type"] == "status" for e in events)
+
+
+def test_ground_prompt_accepts_a_precomputed_decision(monkeypatch, fake_llm):
+    """When the caller has already decided, _ground_prompt must not decide again."""
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    monkeypatch.setattr(rag_service, "run_web_search", lambda q: "live results")
+    out = rag_service._ground_prompt(
+        rag_service.SYSTEM_NORMAL, "who is the current CSK captain", [], "c1", True,
+        web_query="current CSK captain",
+    )
+    assert "live results" in out
+    assert fake_llm["calls"] == []  # no router call: the decision was handed in

@@ -1103,7 +1103,43 @@ def delete_web_context(chat_id: str) -> None:
         db.close()
 
 
-def _ground_prompt(base_system: str, question: str, history: list, chat_id: str = None, web_enabled: bool = True) -> str:
+# Stage labels the streaming chat path reports over SSE. They are the same
+# strings the agent orchestrator uses (_STAGE_LABELS there) and the frontend's
+# agent network keys its nodes on — kept as literals here because rag_service
+# cannot import the orchestrator without a cycle. Emitted only at the moment the
+# work actually happens: a status the reader sees is a claim about what the
+# system is doing, so it is never sent speculatively.
+STAGE_READING_DOCUMENTS = "Reading your documents"
+STAGE_RESEARCHING = "Researching"
+
+_UNDECIDED = object()
+
+
+def _decide_web_query(question: str, history: list, web_enabled: bool):
+    """The single place the live-search decision is made.
+
+    Returns the optimised search query when this turn will hit the web, else
+    None. The cheap regex gate runs first so the common case (greetings, code,
+    general questions) never pays for the router model call. A caller that
+    wants to announce the search before it happens calls this once and hands
+    the result to _ground_prompt, so the decision — an LLM call — is never made
+    twice for one turn.
+    """
+    if not web_enabled:
+        return None
+    if is_search_available() and _might_need_fresh_info(question):
+        return _needs_web_search(question, history)
+    return None
+
+
+def _ground_prompt(
+    base_system: str,
+    question: str,
+    history: list,
+    chat_id: str = None,
+    web_enabled: bool = True,
+    web_query=_UNDECIDED,
+) -> str:
     """
     Always grounds the prompt with today's real date (so the model never assumes
     it is still at its training cutoff). When the question looks time-sensitive,
@@ -1122,19 +1158,20 @@ def _ground_prompt(base_system: str, question: str, history: list, chat_id: str 
         return grounded
 
     # Fresh search only when the question looks time-sensitive — this is what
-    # keeps the common case (greetings, coding, general Q) instant.
-    if is_search_available() and _might_need_fresh_info(question):
-        query = _needs_web_search(question, history)
-        if query:
-            results = run_web_search(query)
-            if results:
-                _remember_web_context(chat_id, results)
-                return (
-                    grounded
-                    + "\n\nThe following are live web search results. Prefer them over outdated "
-                    + "training knowledge for any current, recent, or time-sensitive facts:\n"
-                    + results
-                )
+    # keeps the common case (greetings, coding, general Q) instant. A caller
+    # that has already decided passes the query in; otherwise decide here.
+    if web_query is _UNDECIDED:
+        web_query = _decide_web_query(question, history, web_enabled)
+    if web_query:
+        results = run_web_search(web_query)
+        if results:
+            _remember_web_context(chat_id, results)
+            return (
+                grounded
+                + "\n\nThe following are live web search results. Prefer them over outdated "
+                + "training knowledge for any current, recent, or time-sensitive facts:\n"
+                + results
+            )
 
     # No fresh search this turn — reuse current data already fetched earlier in
     # this conversation so the assistant stays consistent and helpful.
@@ -1639,7 +1676,10 @@ def stream_question(
         # as a bug. Everything that is not pure small talk stays inside strict
         # document grounding below.
         if not has_documents or _is_conversational(question):
-            system_prompt = _ground_prompt(_system_prompt_for(question, history), question, history, chat_id, web_search) + LANGUAGE_REMINDER + style_suffix
+            web_query = _decide_web_query(question, history, web_search)
+            if web_query:
+                yield _sse({"type": "status", "label": STAGE_RESEARCHING, "stage": "research"})
+            system_prompt = _ground_prompt(_system_prompt_for(question, history), question, history, chat_id, web_search, web_query=web_query) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(history)
             messages.append({"role": "user", "content": question})
@@ -1648,6 +1688,9 @@ def stream_question(
             # but the model is less likely to drift / hallucinate / mix languages.
             yield from _stream_completion(messages, 0.3)
         else:
+            # Announced at the moment retrieval starts, not before: this is the
+            # event that lights the Documents node in the UI.
+            yield _sse({"type": "status", "label": STAGE_READING_DOCUMENTS, "stage": "rag"})
             context, sources = _retrieve_relevant(collection, question, active_docs)
 
             # Nothing in the selected document(s) is relevant. With web access
@@ -1667,9 +1710,12 @@ def stream_question(
             if sources:
                 yield _sse({"type": "sources", "sources": sources})
 
+            web_query = _decide_web_query(question, history, web_search)
+            if web_query:
+                yield _sse({"type": "status", "label": STAGE_RESEARCHING, "stage": "research"})
             rag_system = _ground_prompt(
                 _rag_system_prompt(question, history).replace("{context}", context),
-                question, history, chat_id, web_search
+                question, history, chat_id, web_search, web_query=web_query
             ) + LANGUAGE_REMINDER + style_suffix
             messages = [{"role": "system", "content": rag_system}]
             messages.extend(history)
