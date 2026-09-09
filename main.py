@@ -34,15 +34,19 @@ from app.api.routes import kb
 from app.api.routes import payments
 from app.api.routes import agent
 
-# Create database tables if they don't exist yet.
-Base.metadata.create_all(bind=engine)
-
 
 def _ensure_schema():
-    """Idempotent micro-migration: add columns that create_all() won't add to
+    """Create missing tables, then add columns that create_all() won't add to
     tables that already existed before the column was introduced. Works on both
     SQLite (dev) and Postgres (prod) by reading the live column list via the
-    SQLAlchemy inspector and issuing portable ALTER TABLE ADD COLUMN."""
+    SQLAlchemy inspector and issuing portable ALTER TABLE ADD COLUMN.
+
+    This is the only startup work that must finish before serving, so it is
+    kept to as few round trips as possible: the table list is read once and
+    reused, create_all() runs only when a table is actually missing (its
+    checkfirst probe is one query per table, ~30 against a remote Postgres),
+    and each table's columns are read once rather than once per addition.
+    Idempotent — steady state is a single query."""
     # (table, column, DDL type + default) — each added only if missing.
     additions = [
         ("otp_codes", "attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -60,11 +64,19 @@ def _ensure_schema():
     try:
         insp = inspect(engine)
         existing_tables = set(insp.get_table_names())
+        # Tables missing from a fresh (or partially migrated) database get made
+        # here, complete with every column — so they are skipped below.
+        if not set(Base.metadata.tables) <= existing_tables:
+            Base.metadata.create_all(bind=engine)
+        columns_by_table: dict[str, set[str]] = {}
         with engine.connect() as conn:
             for table, column, ddl in additions:
                 if table not in existing_tables:
                     continue  # create_all() already made it with the column
-                cols = {c["name"] for c in insp.get_columns(table)}
+                cols = columns_by_table.get(table)
+                if cols is None:
+                    cols = {c["name"] for c in insp.get_columns(table)}
+                    columns_by_table[table] = cols
                 if column in cols:
                     continue
                 # Postgres uses TRUE/FALSE rather than 0/1 for boolean defaults.
@@ -130,9 +142,24 @@ def _close_out_interrupted_tasks():
 
 
 _ensure_schema()
-_bootstrap_admins()
-_seed_plans()
-_close_out_interrupted_tasks()
+
+
+def _housekeeping():
+    """Startup work that does not have to finish before the first request.
+
+    Admin promotion self-heals on the next /me anyway, plan seeding is a no-op
+    after the first boot, and closing out interrupted agent rows is cosmetic.
+    Running them after import lets uvicorn bind its port immediately instead of
+    waiting on three more round trips to a remote database — on a free-tier
+    host that wakes from sleep, that wait was user-visible."""
+    _bootstrap_admins()
+    _seed_plans()
+    _close_out_interrupted_tasks()
+
+
+import threading as _threading
+
+_threading.Thread(target=_housekeeping, name="startup-housekeeping", daemon=True).start()
 
 # Interactive docs are a development convenience. In production they publish
 # the complete API surface — every admin route, every webhook path, every

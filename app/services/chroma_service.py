@@ -15,14 +15,32 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 # telemetry logger so the broken call can't print even if it still fires.
 logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
 
-import chromadb
-from chromadb.config import Settings
 import re
+import threading
 
-client = chromadb.PersistentClient(
-    path="chroma_db",
-    settings=Settings(anonymized_telemetry=False),
-)
+# The client is built on first use, not at import. Importing chromadb (and the
+# numpy it drags in) and opening the persistent store cost ~10s of a cold start
+# measured with -X importtime, and every route module imports this service, so
+# that cost landed before uvicorn could bind its port — the "No open ports
+# detected" failure on Render. Nothing outside this module touches the client
+# directly; every consumer goes through the functions below.
+_client = None
+_client_lock = threading.Lock()
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                import chromadb
+                from chromadb.config import Settings
+
+                _client = chromadb.PersistentClient(
+                    path="chroma_db",
+                    settings=Settings(anonymized_telemetry=False),
+                )
+    return _client
 
 
 def sanitize_chat_id(chat_id: str):
@@ -49,7 +67,7 @@ def get_or_create_collection(
     )
 
     collection = (
-        client.get_or_create_collection(
+        _get_client().get_or_create_collection(
             name=collection_name
         )
     )
@@ -71,7 +89,7 @@ def delete_collection(
     )
 
     try:
-        client.delete_collection(
+        _get_client().delete_collection(
             name=collection_name
         )
     except Exception:
@@ -81,13 +99,13 @@ def delete_collection(
 
 def get_or_create_kb_collection(collection_name: str):
     """Get/create an isolated ChromaDB collection for one API key's knowledge base."""
-    return client.get_or_create_collection(name=collection_name)
+    return _get_client().get_or_create_collection(name=collection_name)
 
 
 def delete_kb_document_chunks(collection_name: str, upload_uid: str) -> None:
     """Remove all chunks for one document upload from a knowledge-base collection."""
     try:
-        collection = client.get_collection(name=collection_name)
+        collection = _get_client().get_collection(name=collection_name)
         collection.delete(where={"upload_uid": {"$eq": upload_uid}})
     except Exception:
         pass
@@ -96,7 +114,7 @@ def delete_kb_document_chunks(collection_name: str, upload_uid: str) -> None:
 def delete_kb_collection(collection_name: str) -> None:
     """Delete an entire API key's knowledge-base ChromaDB collection."""
     try:
-        client.delete_collection(name=collection_name)
+        _get_client().delete_collection(name=collection_name)
     except Exception:
         pass
 

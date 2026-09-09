@@ -1,9 +1,12 @@
 """Text extraction from uploaded files (PDF, Word, and plain-text/code formats)."""
 
-import fitz  # PyMuPDF
-
 
 def extract_text_from_pdf(file_path: str) -> str:
+    # Lazy like the other extractors below: PyMuPDF is ~3s of import that only
+    # a PDF upload needs, and this module is pulled in by the upload route at
+    # startup.
+    import fitz  # PyMuPDF
+
     doc = fitz.open(file_path)
     try:
         return "".join(page.get_text() for page in doc)
