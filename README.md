@@ -78,3 +78,26 @@ reported separately and behind authentication at `GET /agent/providers`.
 
 `GET /` also returns 200 and would work as a ping target, but `/health` is the
 stable contract — the root is free to change.
+
+## What survives a restart
+
+Render's disk on this tier is ephemeral: a deploy, a recycle or a spin-down
+starts the service from the built image, and anything written to the
+filesystem at runtime is gone. Two things live on that filesystem:
+
+- `chroma_db/` — the ChromaDB vector store, one collection per chat.
+- `uploads/` — the original uploaded files.
+
+The vector store is what retrieval reads, so before September 2026 every
+restart silently erased every uploaded document's embeddings while the chat
+still listed the document. Now each indexed chunk — its exact Chroma id, text,
+embedding, filename and content hash — is mirrored to Postgres (`chat_chunks`)
+at index time by the upload route, and `get_or_create_collection` rebuilds an
+empty collection from that mirror on first access. Retrieval and the upload
+route's "already indexed" check cannot tell a rebuilt collection from the
+original, and no embedding quota is spent on the rebuild. See
+`app/services/chunk_store.py`.
+
+The original files in `uploads/` are not mirrored. Nothing reads them after
+indexing except the admin download endpoint, which will 404 for a file
+uploaded before the most recent restart.
