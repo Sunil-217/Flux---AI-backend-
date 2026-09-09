@@ -72,6 +72,13 @@ def get_or_create_collection(
         )
     )
 
+    # The store on disk does not survive a restart on this hosting tier; the
+    # durable mirror in Postgres does. Rebuild here, at the one point every
+    # consumer passes through, so none of them has to know it happened.
+    from app.services.chunk_store import hydrate
+
+    hydrate(chat_id, collection)
+
     return collection
 
 
@@ -95,6 +102,12 @@ def delete_collection(
     except Exception:
         # Collection may not exist — safe to ignore
         pass
+
+    # The mirror goes with it, or the next access would rebuild what the user
+    # just deleted.
+    from app.services.chunk_store import delete_chunks
+
+    delete_chunks(chat_id)
 
 
 def get_or_create_kb_collection(collection_name: str):

@@ -220,6 +220,33 @@ class KnowledgeDocument(Base):
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class ChatChunk(Base):
+    """One indexed chunk of a document uploaded to a chat, with its embedding.
+
+    ChromaDB persists to a local directory, and on the hosting tier that disk
+    is ephemeral: a deploy or a spin-down erases every collection while the
+    chat still lists the document. Postgres is the only durable store this
+    deployment has, so each chunk and its embedding are written here at index
+    time and the collection is rebuilt from these rows the first time a chat is
+    used after a restart — no re-embedding, no quota spent, no user action.
+
+    `chunk_id` is the exact ChromaDB id, and filename / content_hash mirror the
+    chunk's Chroma metadata, so a rebuilt collection is indistinguishable from
+    the original to retrieval and to the upload route's reuse check."""
+
+    __tablename__ = "chat_chunks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(String, nullable=False, index=True)
+    chunk_id = Column(String, nullable=False, unique=True)
+    filename = Column(String, nullable=False)
+    content_hash = Column(String, nullable=False)
+    position = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+    embedding = Column(Text, nullable=False)  # JSON array of floats
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class WidgetMessage(Base):
     """One turn of an embedded-widget conversation, logged for the developer's
     analytics + transcripts. Grouped into conversations by `session_id`."""

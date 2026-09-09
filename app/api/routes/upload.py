@@ -27,6 +27,7 @@ from app.services.embedding_service import (
     create_embeddings
 )
 
+from app.services.chunk_store import save_chunks
 from app.services.chroma_service import (
     get_or_create_collection,
     sanitize_chat_id,
@@ -112,15 +113,19 @@ def _embed_and_store(chat_id: str, safe_chat_id: str, filename: str, chunks: lis
     # Unique per-upload prefix so a 2nd document's IDs don't collide with the
     # 1st's (which would make Chroma drop them — breaking multiple docs per chat).
     uid = uuid.uuid4().hex[:8]
+    ids = [f"{safe_chat_id}_{uid}_{i}" for i in range(len(chunks))]
     collection.add(
         documents=chunks,
         embeddings=embeddings,
-        ids=[f"{safe_chat_id}_{uid}_{i}" for i in range(len(chunks))],
+        ids=ids,
         metadatas=[
             {"filename": filename, "chat_id": chat_id, "content_hash": digest}
             for _ in range(len(chunks))
         ],
     )
+    # Mirror to the durable store so the collection can be rebuilt after a
+    # restart without spending embedding quota again.
+    save_chunks(chat_id, filename, digest, ids, chunks, embeddings)
     return "replaced" if existing_ids else "indexed"
 
 
