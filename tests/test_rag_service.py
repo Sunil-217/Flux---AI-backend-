@@ -727,3 +727,19 @@ def test_ground_prompt_accepts_a_precomputed_decision(monkeypatch, fake_llm):
     )
     assert "live results" in out
     assert fake_llm["calls"] == []  # no router call: the decision was handed in
+
+
+def test_decide_web_query_never_consults_the_router_when_web_is_off(monkeypatch, fake_llm):
+    """With web access off the answer must come from the model alone — and the
+    router, which is itself an LLM call, must not be paid for a decision that
+    cannot change anything."""
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    assert rag_service._decide_web_query("who is the current CSK captain", [], web_enabled=False) is None
+    assert fake_llm["calls"] == []
+
+
+def test_decide_web_query_skips_the_router_for_a_timeless_question(monkeypatch, fake_llm):
+    """The regex gate runs first so greetings and general questions stay instant."""
+    monkeypatch.setattr(rag_service, "is_search_available", lambda: True)
+    assert rag_service._decide_web_query("hi there", [], web_enabled=True) is None
+    assert fake_llm["calls"] == []
